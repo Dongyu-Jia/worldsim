@@ -1,0 +1,25 @@
+# local data: worlds, runs, settings.json (holds the OpenRouter key) and the model cache; never published
+/data/
+
+# secrets
+.env
+.env.*
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/
+
+# local tooling
+.claude/

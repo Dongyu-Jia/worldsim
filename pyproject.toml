@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worldsim"
+version = "0.1.0"
+description = "A small local world simulation: a state, LLM actors and a synthesizer; one click is one iteration"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dongyu Jia" }]
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.30",
+  "requests>=2.31",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dongyu-Jia/worldsim"
+Repository = "https://github.com/Dongyu-Jia/worldsim"
+Issues = "https://github.com/Dongyu-Jia/worldsim/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.16,<0.17"]
+
+[project.scripts]
+worldsim = "worldsim.server:main"
+
+[tool.setuptools.packages.find]
+include = ["worldsim*"]
+
+[tool.setuptools.package-data]
+# the default world and the no-build web UI
+"worldsim" = ["defaults/*.json", "web/*.html", "web/css/*.css", "web/js/*.js", "web/js/pages/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff.lint]
+# a minimal rule set: syntax / IO errors (E9) and pyflakes (F: undefined names, unused imports, ...)
+select = ["E9", "F"]
