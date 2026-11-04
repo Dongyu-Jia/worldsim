@@ -22,7 +22,7 @@ from . import __version__, config
 from . import audit as A
 from . import model as M
 from . import settings as S
-from .engine import Busy, Engine, RunManager
+from .engine import Busy, Engine, RunManager, checkpoint_summary
 from .openrouter import ModelCatalog, OpenRouterClient, OpenRouterError, Transport
 from .store import Conflict, NotFound, Store
 
@@ -245,7 +245,10 @@ def create_app(root=None, transport: Transport | None = None, backend_factory=No
         pending = _strip_calls(store.load_pending(wid))
         if pending:
             pending.pop("calls", None)
-        return {"world": world, "steps": store.step_numbers(wid), "pending": pending, "busy": runs.busy(wid),
+        steps = store.step_numbers(wid)
+        busy = runs.busy(wid)
+        interrupted = checkpoint_summary(store.load_checkpoint(wid), world, steps[-1] if steps else 0, busy)
+        return {"world": world, "steps": steps, "pending": pending, "busy": busy, "interrupted": interrupted,
                 "calls_per_iteration": engine.call_counts(world)}
 
     @app.put("/api/worlds/{wid}")
@@ -454,8 +457,44 @@ def create_app(root=None, transport: Transport | None = None, backend_factory=No
             raise HTTPException(400, "No OpenRouter key: add one in Settings, or choose Mock (no key) there.")
         try:
             return {"run": runs.start(wid, "run")}
-        except Busy as e:
+        except (Busy, Conflict) as e:
             raise HTTPException(409, str(e)) from None
+
+    @app.post("/api/worlds/{wid}/resume")
+    async def resume(wid: str, request: Request):
+        """Continue an interrupted or paused iteration: what finished is reused, the rest is called."""
+        await _body(request)
+        world_or_404(wid)
+        s = load_settings()
+        if S.effective_backend(s) == "openrouter" and not s.get("api_key"):
+            raise HTTPException(400, "No OpenRouter key: add one in Settings, or choose Mock (no key) there.")
+        try:
+            return {"run": runs.start(wid, "resume")}
+        except (Busy, Conflict) as e:
+            raise HTTPException(409, str(e)) from None
+        except NotFound as e:
+            raise HTTPException(404, str(e)) from None
+
+    @app.post("/api/worlds/{wid}/interrupted/discard")
+    async def discard_interrupted(wid: str, request: Request):
+        await _body(request)
+        world_or_404(wid)
+        not_busy(wid)
+        store.clear_checkpoint(wid)
+        return {"ok": True}
+
+    @app.get("/api/worlds/{wid}/interrupted/audit")
+    def interrupted_audit(wid: str, who: str | None = None):
+        """The audit view of the interrupted iteration: what it did before it stopped."""
+        world = world_or_404(wid)
+        cp = store.load_checkpoint(wid)
+        if not cp:
+            raise HTTPException(404, "there is no interrupted iteration")
+        actors = cp.get("results") if cp.get("results") is not None else list((cp.get("answered") or {}).values())
+        record = {"actors": actors, "steps": cp.get("steps") or [], "calls": cp.get("calls") or []}
+        head = {"step": None, "from_step": cp.get("from_step"), "period": cp.get("period"), "interrupted": True,
+                "status": cp.get("status"), "error": cp.get("error")}
+        return audit_of(record, world, who, head)
 
     @app.get("/api/worlds/{wid}/run")
     def run_status(wid: str):
@@ -468,7 +507,7 @@ def create_app(root=None, transport: Transport | None = None, backend_factory=No
         world_or_404(wid)
         try:
             return {"run": runs.start(wid, "retry")}
-        except Busy as e:
+        except (Busy, Conflict) as e:
             raise HTTPException(409, str(e)) from None
         except NotFound as e:
             raise HTTPException(404, str(e)) from None

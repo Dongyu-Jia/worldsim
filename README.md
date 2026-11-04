@@ -30,6 +30,8 @@ input state ────────────────┼─► every acto
   (default 6), then the question statuses in chunks of at most *x*, then the narrative. Each call answers only its own
   items, so each gets the model's full attention. A step that fails keeps its items from the previous state and marks
   the iteration *partial*.
+- **Resume after a crash**: every answered actor and finished synthesizer step is saved at once; if the server
+  stops mid-iteration, or a refused key or empty credits pause it, **Resume** calls only what is left.
 - **Audit view**: for every actor and every synthesizer step, attempt by attempt (repairs and retries included), the
   exact input sent (messages, request settings, the answer's JSON schema), the model's thinking as the provider
   returned it, and the raw and parsed output with the app's verdict. Thinking is only what the provider returns:

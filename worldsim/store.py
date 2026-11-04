@@ -5,6 +5,8 @@
     worlds/<id>/iterations/000001.json  the iteration that produced step n: actors' outputs, the synthesizer's
                                         answer, flags, changes, every LLM call (prompt, raw response, usage, cost)
     worlds/<id>/pending.json            a failed synthesizer attempt (actors' outputs kept for a retry)
+    worlds/<id>/checkpoint.json         the iteration in flight, saved after every finished actor and synthesizer
+                                        step: after a server restart or a pause it is resumed, not lost
     worlds/<id>/pre_v2/                 world.json and steps/ as they were before a first-format world was migrated
 
 Every write is atomic (temp file + rename). World ids are checked against model.WORLD_ID_RE, so no path escapes.
@@ -280,6 +282,7 @@ class Store:
             self.save_iteration(wid, state["step"], record)
             self.save_step(wid, state)
             self.clear_pending(wid)
+            self.clear_checkpoint(wid)
             self._touch(wid)
 
     def _touch(self, wid: str) -> None:
@@ -289,7 +292,8 @@ class Store:
         write_json(path, w)
 
     def rewind(self, wid: str, n: int) -> int:
-        """Drop every step after n (and their iterations, and a pending failure). Returns how many were dropped."""
+        """Drop every step after n (and their iterations, a pending failure and an interrupted iteration). Returns how
+        many were dropped."""
         with _LOCK:
             steps = self.step_numbers(wid)
             if n not in steps:
@@ -301,6 +305,7 @@ class Store:
                     self._iter_path(wid, s).unlink(missing_ok=True)
                     dropped += 1
             self.clear_pending(wid)
+            self.clear_checkpoint(wid)
             self._touch(wid)
             return dropped
 
@@ -347,6 +352,20 @@ class Store:
 
     def clear_pending(self, wid: str) -> None:
         (self.world_dir(wid) / "pending.json").unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------ checkpoint (the iteration in flight)
+    def load_checkpoint(self, wid: str) -> dict | None:
+        path = self.world_dir(wid) / "checkpoint.json"
+        try:
+            return read_json(path) if path.exists() else None
+        except (OSError, ValueError):
+            return None                     # unreadable: treated as none (writes are atomic, so only by hand)
+
+    def save_checkpoint(self, wid: str, record: dict) -> None:
+        write_json(self.world_dir(wid) / "checkpoint.json", record)
+
+    def clear_checkpoint(self, wid: str) -> None:
+        (self.world_dir(wid) / "checkpoint.json").unlink(missing_ok=True)
 
     # ------------------------------------------------------------------ the default world
     def ensure_default(self) -> str | None:

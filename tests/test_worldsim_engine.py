@@ -390,7 +390,7 @@ def test_an_unexpected_backend_exception_in_one_actor_does_not_stop_the_iteratio
     assert by["a2"]["status"] == "no_response" and "internal error" in by["a2"]["error"]
 
 
-def test_a_non_retryable_error_is_not_retried_and_stops_the_synthesizer(store):
+def test_a_refused_key_pauses_the_iteration_instead_of_failing_it(store):
     w = store.create_world(small_world(n_actors=1))
 
     class NoKey(MockBackend):
@@ -399,9 +399,26 @@ def test_a_non_retryable_error_is_not_retried_and_stops_the_synthesizer(store):
             raise LLMError("no OpenRouter key", "auth", retryable=False)
     backend = NoKey(delay_s=0)
     result = engine_for(store, backend).run(w["id"])
-    assert result["status"] == "failed" and len(backend.calls) == 2      # one actor call, one synthesizer call
-    pending = store.load_pending(w["id"])
-    assert [s["status"] for s in pending["steps"]] == ["failed"] * 5 and pending["steps"][1]["error"].startswith("not run")
+    assert result["status"] == "paused" and len(backend.calls) == 1       # not retried, no synthesizer call
+    cp = store.load_checkpoint(w["id"])
+    assert cp["status"] == "paused" and cp["error"] == "no OpenRouter key" and cp["answered"] == {}
+    assert store.load_pending(w["id"]) is None and store.step_numbers(w["id"]) == [0]
+
+
+def test_another_non_retryable_error_fails_only_its_synthesizer_step(store):
+    w = store.create_world(small_world(n_actors=1))
+
+    class BadStep(MockBackend):
+        def complete(self, req):
+            if req.purpose == "synth" and (req.context.get("step") or {}).get("key") == "values:1":
+                self.calls.append(req)
+                raise LLMError("HTTP 400: this request is too long", "http", retryable=False)
+            return super().complete(req)
+    backend = BadStep(delay_s=0)
+    result = engine_for(store, backend).run(w["id"])
+    assert result["status"] == "done" and result["partial"]               # carried forward, not the whole run
+    steps = store.load_iteration(w["id"], 1)["synthesizer"]["steps"]
+    assert [s["status"] for s in steps].count("failed") == 1 and store.load_checkpoint(w["id"]) is None
 
 
 @pytest.mark.parametrize("text, ok", [

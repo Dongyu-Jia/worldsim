@@ -429,7 +429,7 @@ class MockBackend:
     the recorded request is the body OpenRouter would get, and the raw response has OpenRouter's shape.
 
     A script {call key: [behaviour, ...]} makes the next calls of that key behave in a chosen way: behaviours ok |
-    error | timeout | bad_json | invalid (an actor leaves its required questions unanswered; a synthesizer step
+    error | timeout | auth (a refused key: the iteration pauses) | bad_json | invalid (an actor leaves its required questions unanswered; a synthesizer step
     answers {}) | long (a narrative over the limit) | extra (an indicator chunk adds a key outside its chunk). Call
     keys: "actor:<id>"; for the synthesizer the most specific queue that has entries is used: "synth:values:2", then
     "synth:values" (any indicator chunk), then "synth" (any step). Repairs use the same keys with ":repair"."""
@@ -466,6 +466,9 @@ class MockBackend:
         capture = "on" if req.record_thinking else "off"
         body = request_body(req, "json_schema", {"effort": effort, "exclude": not req.record_thinking} if effort
                             else {"exclude": not req.record_thinking})
+        if behaviour == "auth":
+            raise LLMError("mock: injected refused key (HTTP 401)", "auth", retryable=False,
+                           audit=audit_record(body, None, [], thinking=parse_thinking(None, capture)))
         if behaviour in ("error", "timeout"):
             raise LLMError(f"mock: injected {'failure' if behaviour == 'error' else 'timeout'}",
                            "http" if behaviour == "error" else "timeout",

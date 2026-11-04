@@ -12,14 +12,16 @@ export async function render(root, ctx) {
   try { steps = (await api.get(`${W}/steps`)).steps.filter((s) => s.step > 0); } catch (e) { root.append(ui.errorBox(e)); return; }
   if (!ctx.alive()) return;
   const pending = ctx.meta && ctx.meta.pending;
-  const choices = [...(pending ? ['pending'] : []), ...steps.map((s) => s.step).reverse()];
+  const interrupted = ctx.meta && ctx.meta.interrupted;
+  const choices = [...(interrupted ? ['interrupted'] : []), ...(pending ? ['pending'] : []), ...steps.map((s) => s.step).reverse()];
   if (!choices.length) {
     root.append(h('div', { class: 'card' }, h('h2', null, 'Audit'),
       h('p', { class: 'muted' }, 'No iteration has run yet. Run one on the ', h('a', { href: '#sim' }, 'Simulation'), ' page; every call it makes is recorded here.')));
     return;
   }
   const wantStep = query.get('step');
-  let step = wantStep === 'pending' && pending ? 'pending' : (choices.includes(Number(wantStep)) ? Number(wantStep) : choices[0]);
+  let step = (wantStep === 'pending' && pending) || (wantStep === 'interrupted' && interrupted) ? wantStep
+    : (choices.includes(Number(wantStep)) ? Number(wantStep) : choices[0]);
   let who = query.get('who');
   let participants = [];
 
@@ -30,9 +32,11 @@ export async function render(root, ctx) {
   layout.append(list, detail);
   root.append(head, layout);
 
-  const base = () => (step === 'pending' ? `${W}/pending/audit` : `${W}/iterations/${step}/audit`);
+  const base = () => (step === 'pending' ? `${W}/pending/audit` : step === 'interrupted' ? `${W}/interrupted/audit`
+    : `${W}/iterations/${step}/audit`);
   const stepName = (s) => {
     if (s === 'pending') return `Failed attempt awaiting retry (${pending.period || ''})`;
+    if (s === 'interrupted') return `Interrupted iteration (${interrupted.period || ''}, ${interrupted.status})`;
     const st = steps.find((x) => x.step === s);
     return `Step ${s} · ${st ? st.period : ''}`;
   };
@@ -44,9 +48,9 @@ export async function render(root, ctx) {
 
   // ---------------------------------------------------------------- head: step picker and previous / next
   function drawHead() {
-    const sel = h('select', { 'aria-label': 'Step', onchange: (e) => go(e.target.value === 'pending' ? 'pending' : Number(e.target.value)) },
+    const sel = h('select', { 'aria-label': 'Step', onchange: (e) => go(['pending', 'interrupted'].includes(e.target.value) ? e.target.value : Number(e.target.value)) },
       choices.map((c) => h('option', { value: String(c), selected: c === step }, stepName(c))));
-    const numeric = choices.filter((c) => c !== 'pending');
+    const numeric = choices.filter((c) => typeof c === 'number');
     const i = numeric.indexOf(step);
     const older = i >= 0 && i < numeric.length - 1 ? numeric[i + 1] : null;
     const newer = i > 0 ? numeric[i - 1] : null;

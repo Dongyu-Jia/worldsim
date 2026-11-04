@@ -21,19 +21,25 @@ Failures: an actor call that fails is retried once, then the actor is marked "no
 told. Bad JSON (or a required question left unanswered) gets one repair call; a required question still unanswered
 is marked so. A synthesizer step that fails is retried once; if it still fails its items are carried forward
 (「合成失败，沿用上期」, flagged) and the iteration is marked partial. Only when every indicator and question step fails
-(or a call fails for good, e.g. a bad key) does the iteration fail: the state is unchanged, the actors' outputs are
-kept in pending.json and retry() runs the synthesizer again with them.
+does the iteration fail: the state is unchanged, the actors' outputs are kept in pending.json and retry() runs the
+synthesizer again with them.
+
+Checkpoints: the iteration in flight is saved (checkpoint.json) after every actor that answers and every synthesizer
+step that finishes. A server restart, a crash or a pause loses at most the calls that were running: run(resume=True)
+continues it, reusing what was done. A refused key or exhausted credits (an `auth` error) pauses the iteration instead
+of marking actors "no response" or carrying steps forward, so it resumes once the key works.
 
 RunManager runs iterations in a background thread per world and keeps the live progress the UI polls.
 """
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from . import model as M
@@ -45,6 +51,7 @@ from .store import Conflict, NotFound, Store, now_iso
 
 ITERATION_FORMAT = "worldsim-iteration/2"
 PENDING_FORMAT = "worldsim-pending/2"
+CHECKPOINT_FORMAT = "worldsim-checkpoint/1"
 REASONING_ALLOWANCE = {"none": 0, "minimal": 300, "low": 1000, "medium": 2500, "high": 6000, "xhigh": 10000,
                        "max": 16000}
 ACTOR_OUT_BASE, ACTOR_OUT_PER_QUESTION, ACTOR_OUT_PER_ACTION = 350, 160, 120
@@ -102,6 +109,71 @@ class Progress:
     def snapshot(self) -> dict:
         with self._lock:
             return copy.deepcopy(self.data)
+
+
+def world_hash(world: dict) -> str:
+    """A fingerprint of the world's configuration (not its timestamps): an interrupted iteration resumes only into
+    the world it started in."""
+    body = {k: v for k, v in world.items() if k not in ("created", "updated")}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+class Checkpoint:
+    """The iteration in flight on disk (checkpoint.json), saved after every actor that answers and every synthesizer
+    step that finishes. Phase "actors": the actors that answered are kept (`answered`); phase "synthesizer": every
+    actor result is fixed (`results`) and the finished steps are kept (`steps`), restored as they were on resume."""
+
+    def __init__(self, store: Store, wid: str, data: dict, calls: list[dict]):
+        self.store, self.wid, self.data, self.calls = store, wid, data, calls
+        self._lock = threading.Lock()
+
+    @classmethod
+    def start(cls, store: Store, wid: str, world: dict, state: dict, period: str, mode: str, calls: list[dict],
+              results: list[dict] | None = None) -> "Checkpoint":
+        data = {"format": CHECKPOINT_FORMAT, "world_id": wid, "mode": mode, "from_step": state["step"],
+                "period": period, "world_hash": world_hash(world), "started": now_iso(), "updated": None,
+                "status": "running", "error": None, "resumes": 0,
+                "phase": "synthesizer" if results is not None else "actors", "answered": {}, "results": results,
+                "steps": [], "round": 1}
+        cp = cls(store, wid, data, calls)
+        cp.save()
+        return cp
+
+    def save(self, **kw) -> None:
+        with self._lock:
+            self.data.update(kw)
+            self.data["updated"] = now_iso()
+            self.data["calls"] = list(self.calls)
+            self.store.save_checkpoint(self.wid, self.data)
+
+    def answered(self, result: dict) -> None:
+        with self._lock:
+            self.data["answered"][result["actor_id"]] = result
+        self.save()
+
+    def step_done(self, rec: dict) -> None:
+        with self._lock:
+            self.data["steps"] = [s for s in self.data["steps"] if s.get("key") != rec["key"]] + [copy.deepcopy(rec)]
+        self.save()
+
+
+def checkpoint_summary(data: dict | None, world: dict, latest_step: int, busy: bool) -> dict | None:
+    """What the UI shows for an interrupted or paused iteration; None while it runs, or when there is none."""
+    if not data or busy:
+        return None
+    results = data.get("results")
+    enabled = [a for a in world.get("actors") or [] if a.get("enabled")]
+    ok_steps = {s.get("key") for s in data.get("steps") or [] if s.get("status") == "ok"}
+    usage, cost, complete = _sum_usage(data.get("calls") or [])
+    return {"status": "paused" if data.get("status") == "paused" else "interrupted", "error": data.get("error"),
+            "mode": data.get("mode"), "period": data.get("period"), "from_step": data.get("from_step"),
+            "started": data.get("started"), "updated": data.get("updated"), "phase": data.get("phase"),
+            "resumes": data.get("resumes") or 0,
+            "actors_done": len(results) if results is not None else len(data.get("answered") or {}),
+            "actors_total": len(results) if results is not None else len(enabled),
+            "steps_done": len(ok_steps), "steps_total": len(M.synth_plan(world)), "calls": usage["calls"],
+            "cost": cost, "cost_complete": complete,
+            "resumable": data.get("from_step") == latest_step and data.get("world_hash") == world_hash(world)}
 
 
 # ------------------------------------------------------------------------------------------------ actor answers
@@ -360,8 +432,12 @@ class Engine:
 
     # ------------------------------------------------------------------ actors
     def _run_actor(self, backend, world: dict, settings: dict, actor: dict, state: dict, history: list[dict],
-                   next_period: str, calls: list[dict], lock: threading.Lock, progress: Progress | None) -> dict:
+                   next_period: str, calls: list[dict], lock: threading.Lock, progress: Progress | None,
+                   stop: threading.Event | None = None) -> dict:
         model = self.model_for(world, settings, actor.get("model") or "")
+        if stop is not None and stop.is_set():          # the run is pausing: not called, resumed later
+            return {"actor_id": actor["id"], "name": actor["name"], "status": "not_run", "model": model,
+                    "attempts": 0, "output": None, "notes": [], "error": None}
         params = self.params(world, settings)
         notes_box: list[str] = []
 
@@ -388,6 +464,12 @@ class Engine:
             except LLMError as e:
                 out, error = None, redact(str(e), secrets)
                 if not e.retryable:
+                    if e.kind == "auth" and stop is not None:
+                        stop.set()                  # a refused key or no credits: pause, never "no response"
+                        if progress:
+                            progress.actor(actor["id"], status="failed", error=error)
+                        return {"actor_id": actor["id"], "name": actor["name"], "status": "paused", "model": model,
+                                "attempts": attempt, "output": None, "notes": [], "error": error}
                     break
             if out is not None:
                 if progress:
@@ -400,22 +482,41 @@ class Engine:
                 "attempts": attempts, "output": None, "notes": [], "error": error}
 
     def run_actors(self, backend, world: dict, settings: dict, state: dict, history: list[dict], next_period: str,
-                   calls: list[dict], progress: Progress | None) -> list[dict]:
+                   calls: list[dict], progress: Progress | None, answered: dict | None = None,
+                   on_answer: Callable[[dict], None] | None = None) -> tuple[list[dict], str | None]:
+        """Every enabled actor in parallel -> (results in world order, the pause error or None). `answered`: actors
+        that already answered in an interrupted run (reused, not called again); `on_answer(result)` gets each new
+        answer as it arrives (the checkpoint). A refused key or exhausted credits pauses: actors not started yet are
+        skipped and the error comes back."""
         actors = [a for a in world["actors"] if a.get("enabled")]
+        answered = answered or {}
         lock = threading.Lock()
-        workers = max(1, min(int(settings.get("max_parallel") or 6), len(actors) or 1))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worldsim-actor") as ex:
-            futures = [ex.submit(self._run_actor, backend, world, settings, a, state, history, next_period, calls,
-                                 lock, progress) for a in actors]
-            results = []
-            for a, f in zip(actors, futures):
-                try:
-                    results.append(f.result())
-                except Exception as e:  # noqa: BLE001 - one actor's bug must not stop the iteration
-                    results.append({"actor_id": a["id"], "name": a["name"], "status": "no_response", "attempts": 1,
-                                    "output": None, "notes": [], "model": None,
-                                    "error": redact(f"internal error: {type(e).__name__}: {e}", [settings.get("api_key") or ""])})
-        return results
+        stop = threading.Event()
+        for a in actors:
+            r = answered.get(a["id"])
+            if r and progress:
+                progress.actor(a["id"], status="done", summary=P.output_brief(r.get("output")),
+                               attempts=r.get("attempts", 1), error=None)
+        todo = [a for a in actors if a["id"] not in answered]
+        fresh: dict[str, dict] = {}
+        if todo:
+            workers = max(1, min(int(settings.get("max_parallel") or 6), len(todo)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worldsim-actor") as ex:
+                futures = {ex.submit(self._run_actor, backend, world, settings, a, state, history, next_period, calls,
+                                     lock, progress, stop): a for a in todo}
+                for f in as_completed(futures):
+                    a = futures[f]
+                    try:
+                        r = f.result()
+                    except Exception as e:  # noqa: BLE001 - one actor's bug must not stop the iteration
+                        r = {"actor_id": a["id"], "name": a["name"], "status": "no_response", "attempts": 1,
+                             "output": None, "notes": [], "model": None,
+                             "error": redact(f"internal error: {type(e).__name__}: {e}", [settings.get("api_key") or ""])}
+                    fresh[a["id"]] = r
+                    if r.get("status") == "ok" and on_answer:
+                        on_answer(r)
+        paused = next((r["error"] for r in fresh.values() if r.get("status") == "paused"), None)
+        return [answered.get(a["id"]) or fresh[a["id"]] for a in actors], paused
 
     # ------------------------------------------------------------------ synthesizer
     def _run_step(self, backend, world: dict, step: dict, plan: list[dict], state: dict, results: list[dict],
@@ -444,13 +545,13 @@ class Engine:
             except LLMError as e:
                 out, err = None, redact(str(e), secrets)
                 if not e.retryable:
-                    return None, err, attempt, True
+                    return None, err, attempt, e.kind == "auth"     # auth pauses the run; others fail this step
             if out is not None:
                 return out, None, attempt, False
         return None, err, 2, False
 
     def run_synth(self, backend, world: dict, settings: dict, state: dict, results: list[dict], history: list[dict],
-                  next_period: str, calls: list[dict], progress: Progress | None) -> dict:
+                  next_period: str, calls: list[dict], progress: Progress | None, cp: "Checkpoint | None" = None) -> dict:
         """Every synthesizer step in order -> {output (merged), digest, steps, flags, partial, model, error}. output is
         None when the iteration fails outright (every indicator and question step failed, or a call failed for good)."""
         model = self.model_for(world, settings, (world.get("synthesizer") or {}).get("model") or "")
@@ -470,19 +571,26 @@ class Engine:
         merged: dict = {"summary": "", "values": {}, "statuses": {}, "narrative": None}
         steps: list[dict] = []
         flags: list[dict] = []
-        fatal_error = None
+        paused = None
+        saved = {s.get("key"): s for s in ((cp.data.get("steps") if cp else None) or []) if s.get("status") == "ok"}
         for step in plan:
             rec = {"key": step["key"], "kind": step["kind"], "label": step["label"], "items": list(step["items"]),
                    "groups": list(step["groups"]), "status": "ok", "attempts": 0, "error": None, "output": None,
                    "dropped": []}
-            if fatal_error:
-                out, err, attempts = None, f"not run: {fatal_error}", 0
+            old = saved.get(step["key"])
+            restored = bool(old and old.get("items") == rec["items"] and isinstance(old.get("output"), dict))
+            if restored:                                # finished before an interruption: reused as it was
+                out, err, attempts = copy.deepcopy(old["output"]), None, old.get("attempts", 1)
+                out["dropped"] = list(old.get("dropped") or [])
             else:
                 out, err, attempts, fatal = self._run_step(backend, world, step, plan, state, results, history,
                                                            next_period, digest, written, model, params, calls, lock,
                                                            progress, secrets)
-                if fatal:
-                    fatal_error = err
+                if fatal:                               # a refused key or no credits: pause, resume later
+                    paused = err
+                    if progress:
+                        progress.synth_step(step["key"], status="failed", error=err)
+                    break
             rec["attempts"] = attempts
             kind = step["kind"]
             if out is None:
@@ -531,15 +639,22 @@ class Engine:
                 else:
                     merged["narrative"] = out.get("narrative")
             steps.append(rec)
+            if cp is not None and not restored:
+                cp.step_done(rec)
             if progress:
                 progress.synth_step(step["key"], status="done" if out is not None else "failed",
                                     error=None if out is not None else err)
+        if paused:
+            if progress:
+                progress.synth(status="paused", error=paused)
+            return {"output": None, "paused": paused, "digest": digest, "steps": steps, "flags": flags,
+                    "partial": False, "model": model, "error": paused, "plan": plan}
         item_steps = [s for s in steps if s["kind"] in ("values", "statuses")] or steps
         partial = any(s["status"] == "failed" for s in steps)
         failed_all = all(s["status"] == "failed" for s in item_steps)
         error = None
-        if failed_all or fatal_error:
-            error = fatal_error or next((s["error"] for s in item_steps if s["error"]), "every synthesizer step failed")
+        if failed_all:
+            error = next((s["error"] for s in item_steps if s["error"]), "every synthesizer step failed")
         if progress:
             progress.synth(status="failed" if error else ("partial" if partial else "done"), error=error)
         return {"output": None if error else merged, "digest": digest, "steps": steps, "flags": flags,
@@ -555,15 +670,54 @@ class Engine:
         history = self.history(wid, world, int(state["step"]))
         return world, settings, state, next_period, history
 
-    def run(self, wid: str, progress: Progress | None = None) -> dict:
+    def resumable(self, wid: str, world: dict, state: dict) -> dict:
+        """The interrupted iteration's checkpoint, if it can resume into the world as it is now."""
+        data = self.store.load_checkpoint(wid)
+        if not data:
+            raise NotFound("there is no interrupted iteration to resume")
+        if data.get("from_step") != state["step"]:
+            raise Conflict("the interrupted iteration no longer follows the latest step: discard it")
+        if data.get("world_hash") != world_hash(world):
+            raise Conflict("the world was edited after the interrupted iteration started: discard it and run a new one")
+        return data
+
+    def run(self, wid: str, progress: Progress | None = None, resume: bool = False) -> dict:
+        """One iteration: every actor, then the synthesizer, checkpointed as it goes. With `resume`, the interrupted
+        iteration continues: the actors that answered and the steps that finished are reused, the rest are called."""
         world, settings, state, next_period, history = self._prepare(wid)
         backend = self.backend_factory(settings)
-        started = now_iso()
-        calls: list[dict] = []
-        self.store.clear_pending(wid)
-        results = self.run_actors(backend, world, settings, state, history, next_period, calls, progress)
-        return self._finish(wid, world, settings, backend, state, results, history, next_period, calls, started,
-                            progress, round_no=1)
+        if resume:
+            data = self.resumable(wid, world, state)
+            calls = list(data.get("calls") or [])
+            cp = Checkpoint(self.store, wid, data, calls)
+            cp.save(status="running", error=None, resumes=int(data.get("resumes") or 0) + 1)
+        else:
+            if self.store.load_checkpoint(wid):
+                raise Conflict("an interrupted iteration is waiting: resume it or discard it first")
+            self.store.clear_pending(wid)
+            calls = []
+            cp = Checkpoint.start(self.store, wid, world, state, next_period, "run", calls)
+        results = cp.data.get("results")
+        if results is None:
+            results, paused = self.run_actors(backend, world, settings, state, history, next_period, calls, progress,
+                                              answered=cp.data.get("answered") or {}, on_answer=cp.answered)
+            if paused:
+                return self._pause(cp, paused, state, calls)
+            cp.save(phase="synthesizer", results=results)
+        elif progress:
+            for r in results:
+                progress.actor(r["actor_id"], status="done" if r.get("status") == "ok" else "failed",
+                               summary=P.output_brief(r.get("output")), error=r.get("error"),
+                               attempts=r.get("attempts", 0))
+        return self._finish(wid, world, settings, backend, state, results, history, next_period, calls,
+                            cp.data.get("started") or now_iso(), progress, round_no=int(cp.data.get("round") or 1),
+                            cp=cp)
+
+    @staticmethod
+    def _pause(cp: "Checkpoint", error: str, state: dict, calls: list[dict]) -> dict:
+        cp.save(status="paused", error=error)
+        usage, cost, _ = _sum_usage(calls)
+        return {"status": "paused", "error": error, "step": state["step"], "cost": cost, "usage": usage}
 
     def retry(self, wid: str, progress: Progress | None = None) -> dict:
         pending = self.store.load_pending(wid)
@@ -578,15 +732,22 @@ class Engine:
         for c in calls:
             c.setdefault("round", 1)               # a call of an earlier, failed synthesizer run
         round_no = max((int(c.get("round") or 1) for c in calls), default=0) + 1
+        if self.store.load_checkpoint(wid):
+            raise Conflict("an interrupted iteration is waiting: resume it or discard it first")
+        cp = Checkpoint.start(self.store, wid, world, state, next_period, "retry", calls,
+                              results=pending.get("actors") or [])
+        cp.save(round=round_no, started=pending.get("started") or cp.data["started"])
         return self._finish(wid, world, settings, backend, state, pending.get("actors") or [], history, next_period,
-                            calls, pending.get("started") or now_iso(), progress, round_no=round_no)
+                            calls, pending.get("started") or now_iso(), progress, round_no=round_no, cp=cp)
 
     def _finish(self, wid, world, settings, backend, state, results, history, next_period, calls, started, progress,
-                round_no: int = 1):
+                round_no: int = 1, cp: "Checkpoint | None" = None):
         """`round_no`: 1 for a run, 2+ for a retry of a failed synthesizer (each call is marked with its round)."""
-        res = self.run_synth(backend, world, settings, state, results, history, next_period, calls, progress)
+        res = self.run_synth(backend, world, settings, state, results, history, next_period, calls, progress, cp=cp)
         for c in calls:
             c.setdefault("round", round_no)
+        if res.get("paused") and cp is not None:
+            return self._pause(cp, res["paused"], state, calls)
         usage, cost, complete = _sum_usage(calls)
         if res["output"] is None:
             pending = {"format": PENDING_FORMAT, "world_id": wid, "from_step": state["step"], "period": next_period,
@@ -595,6 +756,7 @@ class Engine:
                        "cost": cost, "cost_complete": complete, "backend": getattr(backend, "name", "?"),
                        "rounds": round_no}
             self.store.save_pending(wid, pending)
+            self.store.clear_checkpoint(wid)
             return {"status": "failed", "error": res["error"], "step": state["step"], "cost": cost, "usage": usage}
         n = int(state["step"]) + 1
         nxt, flags, changes = M.validate_next_state(world["schema"], state, res["output"], period=next_period, step=n,
@@ -722,7 +884,15 @@ class RunManager:
                 raise Busy("an iteration is already running for this world")
             state = self.engine.store.latest_step(wid)
             pending = None
-            if mode == "retry":
+            cp = None
+            if mode == "resume":
+                cp = self.engine.resumable(wid, world, state)
+                fixed = cp.get("results")
+                actors = ([{"id": r["actor_id"], "name": r["name"]} for r in fixed] if fixed is not None
+                          else [a for a in world["actors"] if a.get("enabled")])
+            elif self.engine.store.load_checkpoint(wid):
+                raise Conflict("an interrupted iteration is waiting: resume it or discard it first")
+            elif mode == "retry":
                 pending = self.engine.store.load_pending(wid)
                 if not pending:
                     raise NotFound("there is no failed synthesizer attempt to retry")
@@ -731,6 +901,11 @@ class RunManager:
                 actors = [a for a in world["actors"] if a.get("enabled")]
             period = M.advance_period(state.get("period"), world["period_step"]["unit"], world["period_step"]["count"])
             progress = Progress(wid, mode, actors, int(state["step"]), period, M.synth_plan(world))
+            if cp is not None:
+                progress.set(phase="synthesizer" if cp.get("results") is not None else "actors", resumed=True)
+                for s_ in cp.get("steps") or []:
+                    if s_.get("status") == "ok":
+                        progress.synth_step(s_.get("key"), status="done")
             for r in (pending or {}).get("actors") or []:
                 progress.actor(r["actor_id"], status="done" if r.get("status") == "ok" else "failed",
                                summary=P.output_brief(r.get("output")), error=r.get("error"),
@@ -744,11 +919,16 @@ class RunManager:
 
     def _work(self, wid: str, mode: str, progress: Progress) -> None:
         try:
-            fn = self.engine.retry if mode == "retry" else self.engine.run
-            result = fn(wid, progress)
+            if mode == "retry":
+                result = self.engine.retry(wid, progress)
+            else:
+                result = self.engine.run(wid, progress, resume=mode == "resume")
             if result["status"] == "done":
                 progress.set(status="done", phase="done", step=result["step"], finished=now_iso(), cost=result["cost"],
                              partial=bool(result.get("partial")))
+            elif result["status"] == "paused":
+                progress.set(status="paused", error=result.get("error"), finished=now_iso(),
+                             cost=result.get("cost", 0.0))
             else:
                 progress.set(status="failed", phase="synthesizer", error=result.get("error"), finished=now_iso(),
                              cost=result.get("cost", 0.0))

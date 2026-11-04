@@ -52,7 +52,7 @@ Click **Run one iteration** on the Simulation page: each click is one step (one 
 | `WORLDSIM_LLM` | — | `mock` or `openrouter`: overrides the backend chosen in Settings |
 | `WORLDSIM_OFFLINE` | — | `1`: never fetch the public model list (only the default model is listed) |
 | `WORLDSIM_MOCK_DELAY_S` | 0.3 | how long each mock call takes, so the live progress is visible |
-| `WORLDSIM_MOCK_SCRIPT` | — | scripted mock behaviour to try the failure paths, e.g. `{"synth:values:2": ["error", "error"]}` (that indicator step fails twice and is carried forward). Keys: `actor:<id>`; `synth:<step>` (`synth:digest`, `synth:values:3`, `synth:statuses:1`, `synth:narrative`), `synth:<kind>` (any step of a kind), `synth` (any step); add `:repair` for repair calls. Behaviours: `ok`, `error`, `timeout`, `bad_json`, `invalid` (an actor leaves its required questions unanswered; a synthesizer step answers `{}`), `long` (a narrative over the limit), `extra` (an indicator step adds a key outside its chunk) |
+| `WORLDSIM_MOCK_SCRIPT` | — | scripted mock behaviour to try the failure paths, e.g. `{"synth:values:2": ["error", "error"]}` (that indicator step fails twice and is carried forward). Keys: `actor:<id>`; `synth:<step>` (`synth:digest`, `synth:values:3`, `synth:statuses:1`, `synth:narrative`), `synth:<kind>` (any step of a kind), `synth` (any step); add `:repair` for repair calls. Behaviours: `ok`, `error`, `timeout`, `auth` (a refused key: the iteration pauses), `bad_json`, `invalid` (an actor leaves its required questions unanswered; a synthesizer step answers `{}`), `long` (a narrative over the limit), `extra` (an indicator step adds a key outside its chunk) |
 
 ## Where to put the OpenRouter key
 
@@ -131,9 +131,19 @@ one repair call first; a required question still unanswered after the repair is 
 the step viewer) and the synthesizer is told not to invent an answer. A synthesizer step that fails is retried once
 (each attempt with one repair); a step that still fails carries its items forward from the previous step with the
 reason 「合成失败，沿用上期」 and an error flag, and the iteration is saved but marked **partial**. Only when every
-indicator and question step fails (or a call fails for good, e.g. a refused key, which stops the remaining steps)
-does the iteration fail: the state is unchanged, the error is shown with a **Retry synthesizer** button (the actors'
+indicator and question step fails does the iteration fail: the state is unchanged, the error is shown with a **Retry synthesizer** button (the actors'
 outputs are kept, so only the synthesizer runs again) or **Discard**.
+
+**Checkpoints (resume after a crash or a pause).** The iteration in flight is saved in `checkpoint.json` after every
+actor that answers and every synthesizer step that finishes. If the server stops mid-iteration (a restart, a crash,
+the app closing it), nothing that finished is lost: the Simulation page shows *The iteration … was interrupted* with
+what was saved and the cost so far, and **Resume** calls only what is left (the answered actors and finished steps are
+reused as they were, never paid for again). A refused key or exhausted credits (HTTP 401 / 402 / 403) **pauses** the
+iteration at once instead of marking actors *no response* or carrying steps forward: fix the key or top up, then
+Resume. Any other single failure stays local: an actor without an answer after its retry is *no response*, a step
+that fails is carried forward, and the iteration goes on. A checkpoint resumes only into the same world and step: after
+an edit of the world or a rewind it is refused (Discard it and run a new iteration); *Audit what was done* shows its
+calls on the Audit page.
 
 **History.** Every step can be viewed with the iteration that produced it. **Rewind** to a step drops the later steps
 (after a confirmation); **Fork** creates a new world with the history up to that step.
@@ -194,6 +204,8 @@ All server and model text is inserted as text, never as HTML, under a strict Con
                                              its messages), thinking, raw response, parsed JSON, verdict, HTTP
                                              attempts (each text capped at 256 KB, a cut copy marked so)
 <data>/worlds/<id>/pending.json              a failed synthesizer attempt awaiting retry
+<data>/worlds/<id>/checkpoint.json           the iteration in flight (answered actors, finished steps, calls): resumed
+                                             after a restart or a pause
 <data>/worlds/<id>/pre_v2/                   world.json and steps/ as they were before a migration (below)
 ```
 
@@ -390,6 +402,7 @@ that data. The `data/…` paths below are in Causeway's repository; refresh the 
 | `POST /worlds/{id}/duplicate`, `GET /worlds/{id}/export` | copy without history; download with history |
 | `POST /worlds/{id}/run`, `GET /worlds/{id}/run`, `POST /worlds/{id}/retry`, `POST /worlds/{id}/discard` | start an iteration (background), live progress (actors and synthesizer steps), retry or drop a failed synthesizer attempt |
 | `GET /worlds/{id}/steps`, `/steps/{n}`, `/iterations/{n}/calls`, `/pending/calls` | history (with `partial` and change counts), one step with its iteration (calls without their texts), every call in full |
+| `POST /worlds/{id}/resume`, `POST /worlds/{id}/interrupted/discard`, `GET /worlds/{id}/interrupted/audit[?who=…]` | resume an interrupted or paused iteration (409 if the world changed), drop it, audit what it did (`GET /worlds/{id}` carries its summary as `interrupted`) |
 | `GET /worlds/{id}/iterations/{n}/audit[?who=…]`, `/pending/audit[?who=…]` | the audit view: the participants, or one participant's final output and every call (input, thinking, output, meta); `who` is an actor id or `synthesizer:<step key>` |
 | `POST /worlds/{id}/rewind` (`{step, confirm: true}`), `POST /worlds/{id}/fork` (`{step, name}`) | rewind, fork |
 | `GET /worlds/{id}/estimate` | the cost estimate of the next iteration (one row per call; `counts` of actor and synthesizer calls) |
