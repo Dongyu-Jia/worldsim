@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, config
+from . import audit as A
 from . import model as M
 from . import settings as S
 from .engine import Busy, Engine, RunManager
@@ -86,12 +87,11 @@ async def _body(request: Request) -> dict:
 
 
 def _strip_calls(record: dict | None) -> dict | None:
-    """An iteration (or pending) record without the heavy prompt and response texts of its calls."""
+    """An iteration (or pending) record without the heavy texts of its calls (prompts, thinking, raw responses)."""
     if not record:
         return record
-    out = copy.deepcopy(record)
-    out["calls"] = [{k: v for k, v in c.items() if k not in ("messages", "response_text")}
-                    for c in record.get("calls") or []]
+    out = {k: copy.deepcopy(v) for k, v in record.items() if k != "calls"}
+    out["calls"] = [A.light_call(c) for c in record.get("calls") or []]
     return out
 
 
@@ -410,6 +410,37 @@ def create_app(root=None, transport: Transport | None = None, backend_factory=No
         world_or_404(wid)
         pending = store.load_pending(wid)
         return {"calls": (pending or {}).get("calls") or []}
+
+    def audit_of(record: dict, world: dict, who: str | None, head: dict) -> dict:
+        if not who:
+            return {**head, "participants": A.index(record, world)}
+        d = A.detail(record, world, who)
+        if d is None:
+            raise HTTPException(404, f"no participant {who!r} in this iteration")
+        return {**head, **d}
+
+    @app.get("/api/worlds/{wid}/iterations/{n}/audit")
+    def iteration_audit(wid: str, n: int, who: str | None = None):
+        """The audit view of step n's iteration: the participants (no `who`), or one participant's every call."""
+        world = world_or_404(wid)
+        try:
+            it = store.load_iteration(wid, n)
+        except NotFound as e:
+            raise HTTPException(404, str(e)) from None
+        head = {"step": n, "period_from": it.get("period_from"), "period": it.get("period"), "pending": False,
+                "backend": it.get("backend"), "rounds": it.get("rounds")}
+        return audit_of(it, world, who, head)
+
+    @app.get("/api/worlds/{wid}/pending/audit")
+    def pending_audit(wid: str, who: str | None = None):
+        """The same for the failed attempt awaiting retry."""
+        world = world_or_404(wid)
+        pending = store.load_pending(wid)
+        if not pending:
+            raise HTTPException(404, "there is no failed attempt awaiting retry")
+        head = {"step": None, "from_step": pending.get("from_step"), "period": pending.get("period"), "pending": True,
+                "backend": pending.get("backend"), "rounds": pending.get("rounds"), "error": pending.get("error")}
+        return audit_of(pending, world, who, head)
 
     # ------------------------------------------------------------------ running
     @app.post("/api/worlds/{wid}/run")

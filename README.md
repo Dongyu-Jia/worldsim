@@ -30,7 +30,10 @@ input state ────────────────┼─► every acto
   (default 6), then the question statuses in chunks of at most *x*, then the narrative. Each call answers only its own
   items, so each gets the model's full attention. A step that fails keeps its items from the previous state and marks
   the iteration *partial*.
-- Every prompt, raw response, token count and cost is saved with the iteration and can be opened in the UI.
+- **Audit view**: for every actor and every synthesizer step, attempt by attempt (repairs and retries included), the
+  exact input sent (messages, request settings, the answer's JSON schema), the model's thinking as the provider
+  returned it, and the raw and parsed output with the app's verdict. Thinking is only what the provider returns:
+  Gemini returns summaries of its reasoning, some models return none, and encrypted reasoning cannot be read.
 
 Everything is configurable in the browser: actors, the schema (indicators and state questions), the synthesizer, the
 model per world, actor or synthesizer, and the OpenRouter key.

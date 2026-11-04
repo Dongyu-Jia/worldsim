@@ -82,7 +82,8 @@ export async function render(root, ctx) {
           h('button', { class: 'btn primary', type: 'button', onclick: () => startRun('retry') }, 'Retry synthesizer'),
           h('button', { class: 'btn', type: 'button', onclick: discardPending }, 'Discard'),
           h('button', { class: 'btn ghost', type: 'button', onclick: () => showCalls(`${W}/pending/calls`, 'Calls of the failed attempt') },
-            'Show prompts & responses'))));
+            'Show prompts & responses'),
+          h('a', { class: 'btn ghost', href: '#audit?step=pending' }, 'Audit the failed attempt'))));
     }
   }
 
@@ -380,15 +381,21 @@ export async function render(root, ctx) {
       x.intended_effect ? h('div', { class: 'small muted' }, `Intended effect: ${x.intended_effect}`) : null)));
   }
 
-  function actorCard(r) {
+  function auditLink(n, who) {
+    return h('a', { class: 'btn tiny ghost', href: `#audit?step=${n}&who=${api.enc(who)}`,
+      title: 'The exact input, the model\'s thinking and the raw output of every call' }, 'Audit');
+  }
+
+  function actorCard(r, n) {
     const o = r.output;
+    const audit = n != null ? auditLink(n, r.actor_id) : null;
     if (r.status !== 'ok' || !o) {
-      return h('div', { class: 'actor-out' }, h('h4', null, r.name, h('span', { class: 'badge bad' }, 'no response')),
+      return h('div', { class: 'actor-out' }, h('h4', null, r.name, h('span', { class: 'badge bad' }, 'no response'), audit),
         h('div', { class: 'small muted' }, r.error || ''), h('div', { class: 'small muted' }, `${r.attempts} attempt(s) · ${r.model || ''}`));
     }
     if (!o.answers && o.action_id) {                // an iteration saved before decision questions existed
       return h('div', { class: 'actor-out' },
-        h('h4', null, r.name, h('span', { class: `badge ${o.action_id === 'free' ? 'warn' : 'accent'}` }, o.action_label)),
+        h('h4', null, r.name, h('span', { class: `badge ${o.action_id === 'free' ? 'warn' : 'accent'}` }, o.action_label), audit),
         h('dl', null,
           o.action_detail ? [h('dt', null, 'Action'), h('dd', null, o.action_detail)] : null,
           o.rationale ? [h('dt', null, 'Rationale'), h('dd', null, o.rationale)] : null,
@@ -398,7 +405,7 @@ export async function render(root, ctx) {
     return h('div', { class: 'actor-out' },
       h('h4', null, r.name, h('span', { class: 'badge' }, `${(o.answers || []).length} answers`),
         h('span', { class: 'badge' }, `${(o.actions || []).length} actions`),
-        unanswered ? h('span', { class: 'badge bad' }, `${unanswered} unanswered`) : null),
+        unanswered ? h('span', { class: 'badge bad' }, `${unanswered} unanswered`) : null, audit),
       answerList(o),
       h('div', { class: 'sub-h' }, 'Autonomous actions'), actionCards(o),
       h('dl', null,
@@ -460,7 +467,7 @@ export async function render(root, ctx) {
             h('details', null, h('summary', null, 'Output (raw response)'), h('pre', null, c.response_text ?? '(no response)'))))
             : [h('div', { class: 'small muted' }, 'No call recorded for this step.')]));
         } catch (err) { ui.toast(err.message, 'bad'); e.target.disabled = false; }
-      } }, 'Show input & raw output'), io);
+      } }, 'Show input & raw output'), ' ', auditLink(n, `synthesizer:${st.key}`), io);
       const items = st.items || [];
       box.append(h('details', { class: `synth-item ${st.status}` },
         h('summary', null, h('strong', null, st.label), h('span', { class: `badge ${st.status === 'ok' ? 'ok' : 'bad'}` }, st.status),
@@ -474,7 +481,7 @@ export async function render(root, ctx) {
   function iterationCard(it, n) {
     const fmap = fieldMap();
     const card = h('div', { class: 'card' });
-    const actorCards = (it.actors || []).map(actorCard);
+    const actorCards = (it.actors || []).map((r) => actorCard(r, n));
     const changes = (it.changes || []).map((c) => {
       const f = fmap.get(c.field) || { type: typeof c.to === 'number' ? 'number' : 'text', unit: '' };
       return h('li', null, h('strong', null, c.label || c.field), ': ', ui.valueText(f, c.from), ' → ', h('strong', null, ui.valueText(f, c.to)),

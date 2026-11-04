@@ -45,13 +45,14 @@ def test_the_chat_request_has_the_documented_shape():
     b = r["body"]
     assert b["model"] == "google/gemini-4-argon" and b["messages"][1] == {"role": "user", "content": "user"}
     assert b["temperature"] == 0.7 and b["max_tokens"] == 4096 and b["usage"] == {"include": True}
-    assert b["reasoning"] == {"effort": "low", "exclude": True}
+    assert b["reasoning"] == {"effort": "low", "exclude": False}       # the thinking is asked for (audit view)
     rf = b["response_format"]
     assert rf["type"] == "json_schema" and rf["json_schema"]["name"] == "actor_decision" and rf["json_schema"]["strict"] is True
     assert rf["json_schema"]["schema"]["properties"]["action_id"]["enum"] == ["hold"]
     assert b["provider"] == {"require_parameters": True}
     assert comp.text == '{"action_id": "hold"}' and comp.response_format == "json_schema"
-    assert comp.usage == {"prompt_tokens": 1000, "completion_tokens": 200, "reasoning_tokens": 50, "total_tokens": 1200}
+    assert comp.usage == {"prompt_tokens": 1000, "completion_tokens": 200, "reasoning_tokens": 50, "cached_tokens": 0,
+                          "total_tokens": 1200}
     assert comp.cost == pytest.approx(0.0123) and comp.meta["cost_source"] == "openrouter"
 
 

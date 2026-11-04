@@ -44,7 +44,7 @@ export async function render(root, ctx) {
       s.forced_backend ? h('div', { class: 'banner warn' }, `The server was started with WORLDSIM_LLM=${s.forced_backend}: that backend is used whatever is chosen here.`) : null,
       h('hr'),
       h('h2', null, 'OpenRouter API key'),
-      h('p', { class: 'small muted' }, 'Stored on this machine only, in settings.json in WorldSim's data folder (file mode 0600). It is sent only to '
+      h('p', { class: 'small muted' }, 'Stored on this machine only, in settings.json in WorldSim\'s data folder (file mode 0600). It is sent only to '
         + 'openrouter.ai, never shown here in full, and never written to logs, prompts or saved iterations. Get a key at openrouter.ai/keys.'),
       h('div', { class: 'row' }, h('span', null, 'Stored key: '),
         s.has_key ? h('span', { class: 'badge ok mono' }, s.key_masked) : h('span', { class: 'badge bad' }, 'none')),
@@ -104,6 +104,7 @@ export async function render(root, ctx) {
     const par = h('input', { type: 'number', min: 1, max: 32, step: 1, value: s.max_parallel });
     const tmo = h('input', { type: 'number', min: 10, max: 1800, step: 10, value: s.timeout_s });
     const mxt = h('input', { type: 'number', min: 256, step: 256, value: s.max_tokens ?? '', placeholder: 'provider default' });
+    const think = h('input', { type: 'checkbox', checked: s.record_thinking !== false });
     callCard.append(h('h2', null, 'Calls'),
       h('div', { class: 'inline-fields' },
         ui.field('Temperature', temp, '0–2'),
@@ -111,9 +112,11 @@ export async function render(root, ctx) {
         ui.field('Max parallel calls', par, 'actors called at once'),
         ui.field('Timeout (seconds)', tmo, 'per call'),
         ui.field('Max tokens', mxt, 'blank = provider default')),
+      h('label', { class: 'row small' }, think, 'Record the model\'s thinking (shown on the Audit page; reasoning models only, no extra cost: '
+        + 'its tokens are billed either way)'),
       h('div', { class: 'row' }, h('button', { class: 'btn primary', type: 'button', onclick: () => put({
         temperature: temp.value, reasoning_effort: effort.value, max_parallel: par.value, timeout_s: tmo.value,
-        max_tokens: mxt.value === '' ? null : mxt.value }, 'Call settings saved') }, 'Save call settings')));
+        max_tokens: mxt.value === '' ? null : mxt.value, record_thinking: think.checked }, 'Call settings saved') }, 'Save call settings')));
   }
 
   // ---------------------------------------------------------------- model list

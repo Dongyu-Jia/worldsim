@@ -4,7 +4,9 @@ settings and the key (stored 0600, masked, never returned or saved elsewhere), t
 TestClient only; the OpenRouter transport is a fake."""
 import json
 import os
+import shutil
 import stat
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -413,6 +415,17 @@ def test_the_ui_has_the_decision_question_state_question_and_synthesizer_step_vi
         assert "action_space" not in text and "allow_free_action" not in text and "key_questions:" not in text, name
     css = (config.WEB_DIR / "css" / "app.css").read_text(encoding="utf-8")
     assert ".synth-step" in css and ".sq-item" in css and ".dq-row" in css and ".answer.bad" in css
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to parse the UI's modules")
+def test_every_ui_module_parses(tmp_path):
+    """A syntax error in one page module only shows when that page is opened; parse them all."""
+    web = config.WEB_DIR / "js"
+    for path in list(web.glob("*.js")) + list((web / "pages").glob("*.js")):
+        copy_ = tmp_path / (path.stem + ".mjs")
+        copy_.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        r = subprocess.run(["node", "--check", str(copy_)], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, f"{path.name}: {r.stderr}"
 
 
 def test_the_ui_never_renders_server_text_as_html():

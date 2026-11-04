@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
     "max_parallel": 6,
     "timeout_s": 240,
     "max_tokens": None,               # None = the provider's default
+    "record_thinking": True,          # ask reasoning models to return their reasoning, saved with each call
 }
 _LOCK = threading.Lock()
 BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]+", re.I)
@@ -103,6 +104,14 @@ def validate(patch: dict, base: dict) -> tuple[dict, list[str]]:
                 problems.append(f"{label} must be an integer from {lo} to {hi}")
             else:
                 out[key] = num
+    if "record_thinking" in patch:
+        v = patch.get("record_thinking")
+        if isinstance(v, str) and v.strip().lower() in ("true", "false", "1", "0", "on", "off"):
+            v = v.strip().lower() in ("true", "1", "on")
+        if isinstance(v, bool):
+            out["record_thinking"] = v
+        else:
+            problems.append("record thinking must be true or false")
     if "max_tokens" in patch:
         v = patch.get("max_tokens")
         if v in (None, "", 0):

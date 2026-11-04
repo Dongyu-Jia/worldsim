@@ -12,6 +12,11 @@
     and question present; what is missing is carried forward and flagged; nothing invented);
 (d) the next state and the iteration record (every call's prompt, raw response, usage and cost) are saved.
 
+Every call is logged, attempt by attempt (repairs and retries included), with what the audit view shows: the
+messages, the request as sent (without its messages), the model's thinking as returned, the raw response JSON, the
+parsed JSON, the validator's error and notes, whether this attempt's answer was accepted, the finish reason, the
+served model and provider, the generation id and the HTTP attempts (audit.py builds the view from these).
+
 Failures: an actor call that fails is retried once, then the actor is marked "no response" and the synthesizer is
 told. Bad JSON (or a required question left unanswered) gets one repair call; a required question still unanswered
 is marked so. A synthesizer step that fails is retried once; if it still fails its items are carried forward
@@ -33,7 +38,7 @@ from typing import Any, Callable
 
 from . import model as M
 from . import prompts as P
-from .llm import CallRequest, LLMError, est_tokens, extract_json, make_backend
+from .llm import CallRequest, LLMError, est_tokens, extract_json, make_backend, scrub
 from .openrouter import ModelCatalog
 from .settings import effective_backend, redact
 from .store import Conflict, NotFound, Store, now_iso
@@ -220,11 +225,11 @@ def validate_step_output(world: dict, step: dict, obj: Any, final: bool = False)
 
 
 def _sum_usage(calls: list[dict]) -> tuple[dict, float, bool]:
-    tot = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "calls": len(calls)}
+    tot = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0, "calls": len(calls)}
     cost, complete = 0.0, True
     for c in calls:
         u = c.get("usage") or {}
-        for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+        for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens"):
             if isinstance(u.get(k), (int, float)):
                 tot[k] += int(u[k])
         if c.get("error") and not u:
@@ -255,7 +260,8 @@ class Engine:
         temp = wm.get("temperature")
         return {"temperature": settings.get("temperature") if temp is None else temp,
                 "reasoning_effort": wm.get("reasoning_effort") or settings.get("reasoning_effort") or "",
-                "timeout_s": settings.get("timeout_s") or 240, "max_tokens": settings.get("max_tokens")}
+                "timeout_s": settings.get("timeout_s") or 240, "max_tokens": settings.get("max_tokens"),
+                "record_thinking": settings.get("record_thinking", True) is not False}
 
     def history(self, wid: str, world: dict, upto: int) -> list[dict]:
         """The last `history_window` steps up to `upto`: period, summary, narrative, the digest and the decisions
@@ -287,8 +293,9 @@ class Engine:
     def _call(self, backend, req: CallRequest, calls: list[dict], lock: threading.Lock, who: str, attempt: int,
               progress: Progress | None, secrets: list[str], step_key: str | None = None) -> tuple[Any, str | None]:
         """One request (+ one repair on an unusable answer) -> (parsed object | None, error | None). Every call is
-        logged. The validator gets final=True on the repair."""
+        logged with its audit fields. The validator gets final=True on the repair."""
         validator = req.context.get("_validator")
+        notes_box = req.context.get("_notes")
         text, err = "", None
         for repair in (False, True):
             r = req if not repair else CallRequest(**{**req.__dict__, "messages": P.repair_messages(req.messages, text, err),
@@ -296,12 +303,16 @@ class Engine:
             entry = {"who": who, "purpose": req.purpose, "step": step_key, "attempt": attempt, "repair": repair,
                      "model": req.model, "started": now_iso(), "messages": r.messages, "response_format": None,
                      "response_text": None, "usage": None, "cost": None, "cost_source": None, "error": None,
-                     "duration_s": None}
+                     "duration_s": None, "schema_name": req.schema_name, "request": None, "request_truncated": False,
+                     "thinking": None, "raw_response": None, "raw_response_truncated": False, "http_attempts": [],
+                     "finish_reason": None, "native_finish_reason": None, "provider": None, "generation_id": None,
+                     "parsed": None, "validation_error": None, "notes": [], "accepted": False}
             t0 = time.monotonic()
             try:
                 comp = backend.complete(r)
             except LLMError as e:
-                entry.update(error=redact(str(e), secrets), duration_s=round(time.monotonic() - t0, 3))
+                entry.update(error=redact(str(e), secrets), duration_s=round(time.monotonic() - t0, 3),
+                             **self._audit_fields(getattr(e, "audit", None), secrets))
                 with lock:
                     calls.append(entry)
                 if repair:
@@ -309,13 +320,27 @@ class Engine:
                 raise
             entry.update(response_format=comp.response_format, response_text=comp.text, usage=comp.usage,
                          cost=comp.cost, cost_source=comp.meta.get("cost_source"), served_model=comp.model,
-                         duration_s=round(time.monotonic() - t0, 3))
+                         duration_s=round(time.monotonic() - t0, 3),
+                         finish_reason=comp.meta.get("finish_reason"),
+                         native_finish_reason=comp.meta.get("native_finish_reason"),
+                         provider=comp.meta.get("provider"), generation_id=comp.meta.get("id"),
+                         **self._audit_fields({**(comp.audit or {}), "thinking": comp.thinking or None}, secrets))
             if progress:
                 progress.add_cost(comp.cost)
             text = comp.text
             obj, err = extract_json(comp.text)
+            entry["parsed"] = copy.deepcopy(obj)
             if obj is not None and validator:
+                if notes_box is not None:
+                    notes_box[:] = []
                 obj, err = validator(obj, repair)
+                if notes_box:
+                    entry["notes"] = list(notes_box)
+                if isinstance(obj, dict) and obj.get("dropped"):
+                    entry["notes"] = entry["notes"] + ["keys outside this step were dropped: "
+                                                       + ", ".join(map(str, obj["dropped"][:12]))]
+            entry["validation_error"] = err
+            entry["accepted"] = not err
             if err:
                 entry["error"] = f"unusable answer: {err}"
             with lock:
@@ -325,6 +350,13 @@ class Engine:
             if not repair and progress and step_key:
                 progress.synth_step(step_key, status="repairing")
         return None, f"bad answer after one repair: {err}"
+
+    @staticmethod
+    def _audit_fields(audit: dict | None, secrets: list[str]) -> dict:
+        """The audit part of a call entry from a Completion's (or an LLMError's) audit record, redacted again."""
+        a = audit or {}
+        keep = ("request", "request_truncated", "thinking", "raw_response", "raw_response_truncated", "http_attempts")
+        return {k: scrub(a[k], secrets) for k in keep if k in a and a[k] is not None}
 
     # ------------------------------------------------------------------ actors
     def _run_actor(self, backend, world: dict, settings: dict, actor: dict, state: dict, history: list[dict],
@@ -340,7 +372,7 @@ class Engine:
 
         peers = [a["name"] for a in world["actors"] if a.get("enabled") and a["id"] != actor["id"]]
         ctx = {"world": {"id": world["id"], "name": world["name"], "language": world["language"]},
-               "actor": actor, "state": state, "peers": peers, "_validator": validator}
+               "actor": actor, "state": state, "peers": peers, "_validator": validator, "_notes": notes_box}
         req = CallRequest(purpose="actor", model=model, schema_name=P.ACTOR_SCHEMA_NAME,
                           messages=P.actor_messages(world, actor, state, history, next_period),
                           json_schema=P.actor_schema(actor), context=ctx, **params)
@@ -531,7 +563,7 @@ class Engine:
         self.store.clear_pending(wid)
         results = self.run_actors(backend, world, settings, state, history, next_period, calls, progress)
         return self._finish(wid, world, settings, backend, state, results, history, next_period, calls, started,
-                            progress)
+                            progress, round_no=1)
 
     def retry(self, wid: str, progress: Progress | None = None) -> dict:
         pending = self.store.load_pending(wid)
@@ -543,17 +575,25 @@ class Engine:
             raise Conflict("the failed attempt no longer matches the current step: run a new iteration")
         backend = self.backend_factory(settings)
         calls = list(pending.get("calls") or [])
+        for c in calls:
+            c.setdefault("round", 1)               # a call of an earlier, failed synthesizer run
+        round_no = max((int(c.get("round") or 1) for c in calls), default=0) + 1
         return self._finish(wid, world, settings, backend, state, pending.get("actors") or [], history, next_period,
-                            calls, pending.get("started") or now_iso(), progress)
+                            calls, pending.get("started") or now_iso(), progress, round_no=round_no)
 
-    def _finish(self, wid, world, settings, backend, state, results, history, next_period, calls, started, progress):
+    def _finish(self, wid, world, settings, backend, state, results, history, next_period, calls, started, progress,
+                round_no: int = 1):
+        """`round_no`: 1 for a run, 2+ for a retry of a failed synthesizer (each call is marked with its round)."""
         res = self.run_synth(backend, world, settings, state, results, history, next_period, calls, progress)
+        for c in calls:
+            c.setdefault("round", round_no)
         usage, cost, complete = _sum_usage(calls)
         if res["output"] is None:
             pending = {"format": PENDING_FORMAT, "world_id": wid, "from_step": state["step"], "period": next_period,
                        "started": started, "failed_at": now_iso(), "error": res["error"], "actors": results,
                        "calls": calls, "synthesizer_model": res["model"], "steps": res["steps"], "usage": usage,
-                       "cost": cost, "cost_complete": complete, "backend": getattr(backend, "name", "?")}
+                       "cost": cost, "cost_complete": complete, "backend": getattr(backend, "name", "?"),
+                       "rounds": round_no}
             self.store.save_pending(wid, pending)
             return {"status": "failed", "error": res["error"], "step": state["step"], "cost": cost, "usage": usage}
         n = int(state["step"]) + 1
@@ -571,7 +611,7 @@ class Engine:
                                   "digest": res["digest"], "steps": res["steps"], "output": res["output"]},
                   "partial": res["partial"], "flags": flags, "changes": changes,
                   "status_changes": nxt["status_changes"], "usage": usage, "cost": cost, "cost_complete": complete,
-                  "calls": calls}
+                  "rounds": round_no, "calls": calls}
         nxt["usage"], nxt["cost"], nxt["cost_complete"] = usage, cost, complete
         self.store.append(wid, nxt, record)
         return {"status": "done", "step": n, "period": next_period, "cost": cost, "usage": usage, "partial": res["partial"],
