@@ -341,7 +341,7 @@ def test_an_openrouter_run_leaves_the_key_only_in_settings(tmp_path, caplog):
     wid = new_world(client)["id"]
     final = run(client, app, wid)
     assert final["status"] == "done" and len(fake.chats) == 8 and final["cost"] == pytest.approx(0.0123 * 8)
-    assert fake.chats[0]["body"]["model"] == "google/gemini-4-argon"
+    assert fake.chats[0]["body"]["model"] == "anthropic/claude-haiku-5.5"
     for path in (tmp_path / "ws").rglob("*"):
         if path.is_file():
             assert (TEST_KEY in path.read_text(encoding="utf-8", errors="replace")) == (path.name == "settings.json"), path
@@ -438,5 +438,5 @@ def test_the_ui_never_renders_server_text_as_html():
 
 def test_the_models_endpoint_works_offline(client):
     data = client.get("/api/models").json()
-    assert data["source"] == "builtin" and data["models"][0]["id"] == "google/gemini-4-argon"
-    assert data["default_model"] == "google/gemini-4-argon"
+    assert data["source"] == "builtin" and data["models"][0]["id"] == "anthropic/claude-haiku-5.5"
+    assert data["default_model"] == "anthropic/claude-haiku-5.5"

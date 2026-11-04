@@ -55,7 +55,8 @@ Open http://127.0.0.1:8940. The first start creates the preloaded world 「美�
 indicators, 22 state questions; one quarter per step).
 
 - **With a key**: Settings → OpenRouter API key → paste your `sk-or-v1-…` key (https://openrouter.ai/keys). The default
-  model is `google/gemini-4-argon`; any OpenRouter model id can be picked or typed.
+  model is `anthropic/claude-haiku-5.5` (cheap and fast); any OpenRouter model id can be picked or typed, for
+  example `google/gemini-4-argon` for deeper reasoning at about 20 times the price.
 - **Without a key**: choose *Mock (no key)* in Settings, or start with `WORLDSIM_LLM=mock python -m worldsim`. The mock
   is free and deterministic; it exercises the mechanics, not the economics.
 

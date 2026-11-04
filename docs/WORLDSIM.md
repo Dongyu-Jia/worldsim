@@ -30,7 +30,7 @@ input state ────────────────┼─► every acto
 - The **synthesizer** is multi-shot: every iteration it makes a digest of the period (本季要事), then writes the
   indicators in chunks of at most **x** (default 6), then the question statuses in chunks of at most x, then the
   narrative. Each call answers only its own keys, so each item gets the model's full attention.
-- LLM calls go to **OpenRouter** with your key (default model `google/gemini-4-argon`), or to a deterministic **mock**
+- LLM calls go to **OpenRouter** with your key (default model `anthropic/claude-haiku-5.5`), or to a deterministic **mock**
   that needs no key.
 
 ## Run it
@@ -68,8 +68,11 @@ Open **Settings → OpenRouter API key**, paste the key (`sk-or-v1-…`, from ht
 
 ## Models and cost
 
-- **Default model**: `google/gemini-4-argon` (in OpenRouter's public model list on 2026-11-02: $2 / M input tokens,
-  $10 / M output tokens, 1,048,576 context, structured outputs, reasoning always on with efforts low / medium / high).
+- **Default model**: `anthropic/claude-haiku-5.5` (in OpenRouter's public model list on 2026-11-04: $0.10 / M input
+  tokens, $0.50 / M output tokens, 1,000,000 context, structured outputs, reasoning optional with efforts none to max,
+  default medium). It takes no `temperature`, so WorldSim leaves that parameter out for it (any model whose
+  `supported_parameters` lack it gets none). `google/gemini-4-argon` ($2 / $10, reasoning always on) stays in the
+  built-in list for when the model list cannot be fetched.
 - **Model picker**: the public list (`GET https://openrouter.ai/api/v1/models`, no key, cached for a day in
   `models_cache.json` in the data folder) with search; any model id can also be typed. Overrides: per world (Worlds page),
   per actor (Actors page) and for the synthesizer (Synthesizer page).
@@ -84,10 +87,11 @@ Open **Settings → OpenRouter API key**, paste the key (`sk-or-v1-…`, from ht
   (HTTP 400/404/422) the call is repeated once in JSON mode. Every answer also goes through a tolerant JSON parser.
 - **Cost**: the Simulation page shows an estimate before each click (the real prompts' length, an assumed answer
   length and a reasoning allowance, priced with the model list) and the actual cost after it (OpenRouter's
-  `usage.cost`; computed from the list prices when absent). The default world's estimate with Gemini 4 Argon is about
-  **$2.1–2.4 per iteration**: 36 calls (14 actors + 22 synthesizer steps at x = 6), most of it the synthesizer's
-  prompts (each step sees the previous state, every decision and what was written before it) and the model's
-  mandatory reasoning. A larger x means fewer, longer synthesizer calls; the number of calls is shown next to the
+  `usage.cost`; computed from the list prices when absent). The default world's first iteration is estimated at about
+  **$0.10 with Claude Haiku 5.5** (the default) and about $2.1 with Gemini 4 Argon: 36 calls (14 actors + 22
+  synthesizer steps at x = 6), about 440k prompt and 120k answer tokens, most of it the synthesizer's prompts (each
+  step sees the previous state, every decision and what was written before it) and reasoning. Later iterations cost
+  more as the history window fills. A larger x means fewer, longer synthesizer calls; the number of calls is shown next to the
   **Run** button. Mock runs are free.
 
 ## An iteration, step by step

@@ -183,7 +183,7 @@ export async function pickModel(current = '') {
     const search = h('input', { type: 'search', placeholder: 'Search models (id or name)…', value: '', 'data-autofocus': true,
       'aria-label': 'Search models' });
     const results = h('div', { class: 'model-results', role: 'listbox' });
-    const custom = h('input', { type: 'text', value: current, placeholder: 'or type any model id, e.g. google/gemini-4-argon' });
+    const custom = h('input', { type: 'text', value: current, placeholder: 'or type any model id, e.g. anthropic/claude-haiku-5.5' });
     const draw = () => {
       const q = search.value.trim().toLowerCase();
       const hits = models.filter((m) => !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).slice(0, 150);

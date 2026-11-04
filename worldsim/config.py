@@ -12,7 +12,7 @@ DEFAULT_WORLD_FILE = DEFAULTS_DIR / "us_2026q4.json"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8940
-DEFAULT_MODEL = "google/gemini-4-argon"
+DEFAULT_MODEL = "anthropic/claude-haiku-5.5"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 APP_REFERER = "http://localhost"
 APP_TITLE = "WorldSim"

@@ -149,7 +149,7 @@ def test_the_catalogue_falls_back_to_the_default_model_without_network(tmp_path,
         raise RuntimeError("offline")
     cat._transport = down
     data = cat.get()
-    assert data["source"] == "builtin" and [m["id"] for m in data["models"]] == ["google/gemini-4-argon"]
+    assert data["source"] == "builtin" and [m["id"] for m in data["models"]] == ["anthropic/claude-haiku-5.5", "google/gemini-4-argon"]
     assert "could not fetch" in data["note"]
 
 
@@ -199,3 +199,11 @@ def test_tests_never_reach_the_network():
     with pytest.raises(AssertionError, match="never reach the network"):
         OR.get_transport()("GET", "https://openrouter.ai/api/v1/models", {}, None, 1)
     assert time.time() > 0
+
+
+@pytest.mark.parametrize("model, sent", [("anthropic/claude-haiku-5.5", False), ("google/gemini-4-argon", True)])
+def test_temperature_is_sent_only_to_models_that_take_it(model, sent):
+    fake = FakeTransport(script=[(200, chat_response('{"action_id": "hold"}', model=model))])
+    OpenRouterBackend(TEST_KEY, catalog=Catalog(), transport=fake).complete(request(model=model))
+    body = fake.chats[0]["body"]
+    assert ("temperature" in body) is sent and body["provider"] == {"require_parameters": True}
