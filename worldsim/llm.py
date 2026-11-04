@@ -153,10 +153,12 @@ def parse_thinking(msg: dict | None, capture: str = "on", reasoning_tokens: Any 
             "reasoning_tokens": reasoning_tokens if isinstance(reasoning_tokens, (int, float)) else None}
 
 
-def request_body(req: CallRequest, fmt: str, reasoning: dict | None) -> dict:
-    """The chat-completions body for this request (the key goes in the Authorization header, never here)."""
+def request_body(req: CallRequest, fmt: str, reasoning: dict | None, temperature: bool = True) -> dict:
+    """The chat-completions body for this request (the key goes in the Authorization header, never here).
+    `temperature`: False for a model that does not take it (with provider.require_parameters it would find no
+    endpoint), so it is left out."""
     body: dict[str, Any] = {"model": req.model, "messages": req.messages, "usage": {"include": True}}
-    if req.temperature is not None:
+    if req.temperature is not None and temperature:
         body["temperature"] = req.temperature
     if req.max_tokens:
         body["max_tokens"] = req.max_tokens
@@ -298,7 +300,8 @@ class OpenRouterBackend:
         return ({"effort": effort, "exclude": False} if effort else None), ("on" if effort else "unknown")
 
     def _body(self, req: CallRequest, fmt: str) -> dict:
-        return request_body(req, fmt, self._reasoning(req)[0])
+        info = self.catalog.lookup(req.model)
+        return request_body(req, fmt, self._reasoning(req)[0], not (info and info.get("temperature") is False))
 
     def complete(self, req: CallRequest) -> Completion:
         fmt = self._format_for(req.model)
@@ -306,8 +309,11 @@ class OpenRouterBackend:
         attempts: list[dict] = []
         sent: dict = {}
 
+        info = self.catalog.lookup(req.model)
+        temperature = not (info and info.get("temperature") is False)
+
         def send(fmt: str) -> dict:
-            body = request_body(req, fmt, reasoning)
+            body = request_body(req, fmt, reasoning, temperature)
             if sent:                                    # the refused body, kept with its attempt (the schema)
                 attempts[-1]["request"] = {k: v for k, v in sent["body"].items() if k != "messages"}
             sent["body"] = body

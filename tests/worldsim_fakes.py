@@ -79,6 +79,10 @@ class FakeTransport:
 
 
 MODELS = [
+    {"id": "anthropic/claude-haiku-5.5", "name": "Anthropic: Claude Haiku 5.5", "context_length": 1000000,
+     "pricing": {"prompt": "0.0000001", "completion": "0.0000005"},
+     "supported_parameters": ["max_tokens", "reasoning", "reasoning_effort", "response_format", "structured_outputs"],
+     "reasoning": {"mandatory": False, "supported_efforts": ["high", "medium", "low", "none"], "default_effort": "medium"}},
     {"id": "google/gemini-4-argon", "name": "Google: Gemini 4 Argon", "context_length": 1048576,
      "pricing": {"prompt": "0.000002", "completion": "0.00001"},
      "supported_parameters": ["max_tokens", "reasoning", "reasoning_effort", "response_format", "structured_outputs",

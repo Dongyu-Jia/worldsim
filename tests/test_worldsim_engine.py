@@ -345,7 +345,7 @@ def test_the_estimate_prices_every_call_with_the_model_list(store):
     assert est["calls"] == 8 and est["priced"] and est["cost"] > 0
     assert est["counts"] == {"actors": 3, "synthesizer": 5, "total": 8, "synth_digest": 1, "synth_values": 2,
                              "synth_statuses": 1, "synth_narrative": 1}
-    assert {r["model"] for r in est["rows"]} == {"google/gemini-4-argon"}
+    assert {r["model"] for r in est["rows"]} == {"anthropic/claude-haiku-5.5"}
     assert est["prompt_tokens"] > 0 and est["next_period"] == "2027Q1"
     assert [r["who"] for r in est["rows"]][3:] == ["synthesizer · Digest", "synthesizer · Indicators 1/2",
                                                    "synthesizer · Indicators 2/2", "synthesizer · Questions 1/1",

@@ -27,7 +27,14 @@ CACHE_TTL_S = 24 * 3600
 
 # The default model as listed by GET /api/v1/models on 2026-11-02 (prices in USD per token).
 BUILTIN_MODELS = [{
-    "id": config.DEFAULT_MODEL, "name": "Google: Gemini 4 Argon", "context_length": 1048576,
+    "id": config.DEFAULT_MODEL, "name": "Anthropic: Claude Haiku 5.5", "context_length": 1000000,
+    "pricing": {"prompt": "0.0000001", "completion": "0.0000005"},
+    "supported_parameters": ["include_reasoning", "max_completion_tokens", "max_tokens", "reasoning", "reasoning_effort",
+                             "response_format", "stop", "structured_outputs", "tool_choice", "tools", "verbosity"],
+    "reasoning": {"mandatory": False, "supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"],
+                  "default_effort": "medium"},
+}, {
+    "id": "google/gemini-4-argon", "name": "Google: Gemini 4 Argon", "context_length": 1048576,
     "pricing": {"prompt": "0.000002", "completion": "0.00001"},
     "supported_parameters": ["include_reasoning", "max_tokens", "reasoning", "reasoning_effort", "response_format",
                              "seed", "stop", "structured_outputs", "temperature", "tool_choice", "tools", "top_p"],

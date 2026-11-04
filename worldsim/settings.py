@@ -81,7 +81,7 @@ def validate(patch: dict, base: dict) -> tuple[dict, list[str]]:
     if "default_model" in patch:
         m = str(patch.get("default_model") or "").strip()
         if not m or len(m) > 200 or any(c.isspace() for c in m):
-            problems.append("default model must be a model id such as google/gemini-4-argon")
+            problems.append("default model must be a model id such as anthropic/claude-haiku-5.5")
         else:
             out["default_model"] = m
     if "temperature" in patch:
