@@ -82,7 +82,8 @@ async function reloadWorld() {
   if (!state.wid) { state.world = null; return null; }
   const data = await api.get(`worlds/${api.enc(state.wid)}`);
   state.world = data.world;
-  state.worldMeta = { steps: data.steps, pending: data.pending, busy: data.busy, calls_per_iteration: data.calls_per_iteration };
+  state.worldMeta = { steps: data.steps, pending: data.pending, interrupted: data.interrupted, busy: data.busy,
+    calls_per_iteration: data.calls_per_iteration };
   return state.world;
 }
 

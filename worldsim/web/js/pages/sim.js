@@ -27,7 +27,9 @@ export async function render(root, ctx) {
   root.append(headCard, historyCard, stepBox);
 
   // ---------------------------------------------------------------- head: run button, estimate, progress, failure
-  const runBtn = h('button', { class: 'btn primary big', type: 'button', onclick: () => startRun('run') }, 'Run one iteration');
+  const interrupted = () => (ctx.meta && ctx.meta.interrupted) || null;
+  const runBtn = h('button', { class: 'btn primary big', type: 'button',
+    onclick: () => startRun(interrupted() && interrupted().resumable ? 'resume' : 'run') }, 'Run one iteration');
   const callsLine = h('div', { class: 'cost-line calls-line' });
   const costLine = h('div', { class: 'cost-line' }, 'Estimating cost…');
   const lastCost = h('div', { class: 'cost-line' });
@@ -59,7 +61,9 @@ export async function render(root, ctx) {
       world.description ? h('details', { class: 'world-desc' }, h('summary', null, 'World description'),
         h('p', { class: 'pre' }, world.description)) : null,
       banners, progressBox);
-    runBtn.disabled = running || !enabled;
+    const cp = interrupted();
+    runBtn.textContent = cp && cp.resumable && !running ? 'Resume the iteration' : 'Run one iteration';
+    runBtn.disabled = running || !enabled || !!(cp && !cp.resumable);
     drawBanners();
   }
 
@@ -73,6 +77,20 @@ export async function render(root, ctx) {
     if (!world.actors.some((a) => a.enabled)) {
       banners.append(h('div', { class: 'banner warn' }, 'No actor is enabled. ', h('a', { href: '#actors' }, 'Enable one'), '.'));
     }
+    const cp = interrupted();
+    if (cp && !running) {
+      const what = `${cp.actors_done}/${cp.actors_total} actors answered and ${cp.steps_done}/${cp.steps_total} synthesizer steps finished`;
+      banners.append(h('div', { class: `banner ${cp.status === 'paused' ? 'bad' : 'warn'}`, role: 'alert' },
+        h('strong', null, cp.status === 'paused' ? `The iteration for ${cp.period} is paused` : `The iteration for ${cp.period} was interrupted`),
+        cp.status === 'paused' ? `: ${cp.error || 'an error'}. ` : ` (the server stopped while it ran, ${ui.when(cp.updated)}). `,
+        `Saved so far: ${what}, ${ui.money(cp.cost)} spent. `,
+        cp.resumable ? 'Resume calls only what is left; nothing that finished is paid for again.'
+          : 'It cannot resume: the world was edited or the latest step changed since it started. Discard it to run a new one.',
+        h('div', { class: 'row', role: 'group' },
+          cp.resumable ? h('button', { class: 'btn primary', type: 'button', onclick: () => startRun('resume') }, 'Resume') : null,
+          h('button', { class: 'btn', type: 'button', onclick: discardInterrupted }, 'Discard'),
+          h('a', { class: 'btn ghost', href: '#audit?step=interrupted' }, 'Audit what was done'))));
+    }
     const p = ctx.meta && ctx.meta.pending;
     if (p && !running) {
       banners.append(h('div', { class: 'banner bad', role: 'alert' },
@@ -85,6 +103,12 @@ export async function render(root, ctx) {
             'Show prompts & responses'),
           h('a', { class: 'btn ghost', href: '#audit?step=pending' }, 'Audit the failed attempt'))));
     }
+  }
+
+  async function discardInterrupted() {
+    if (!(await ui.confirmBox({ title: 'Discard the interrupted iteration?', body: 'What it saved so far (the actors\' answers and the '
+      + 'finished synthesizer steps) is dropped. The next run starts the iteration from the beginning.', ok: 'Discard', danger: true }))) return;
+    try { await api.post(`${W}/interrupted/discard`, {}); await ctx.reloadWorld(); drawHead(); } catch (e) { ui.toast(e.message, 'bad'); }
   }
 
   async function discardPending() {
@@ -115,7 +139,8 @@ export async function render(root, ctx) {
 
   // ---------------------------------------------------------------- live progress
   const STATUS = { queued: ['queued', ''], running: ['running', 'accent'], retrying: ['retrying', 'warn'], done: ['done', 'ok'],
-    failed: ['no response', 'bad'], waiting: ['waiting', ''], repairing: ['repairing', 'warn'], partial: ['partial', 'warn'] };
+    failed: ['no response', 'bad'], waiting: ['waiting', ''], repairing: ['repairing', 'warn'], partial: ['partial', 'warn'],
+    paused: ['paused', 'bad'] };
 
   function chip(status, synth = false) {
     const [label, cls] = synth && status === 'failed' ? ['failed', 'bad'] : (STATUS[status] || [status, '']);
@@ -128,8 +153,9 @@ export async function render(root, ctx) {
     if (!run) return;
     const isLive = run.status === 'running';
     const head = isLive
-      ? `${run.mode === 'retry' ? 'Retrying the synthesizer' : 'Running'}: ${run.phase === 'actors' ? 'actors deciding' : 'synthesizer writing'} ${run.period} …`
-      : run.status === 'done' ? `Finished: step ${run.step} (${run.period}) saved` : `Failed: ${run.error || ''}`;
+      ? `${run.mode === 'retry' ? 'Retrying the synthesizer' : run.mode === 'resume' ? 'Resuming' : 'Running'}: ${run.phase === 'actors' ? 'actors deciding' : 'synthesizer writing'} ${run.period} …`
+      : run.status === 'done' ? `Finished: step ${run.step} (${run.period}) saved`
+        : run.status === 'paused' ? `Paused: ${run.error || ''} (what finished is saved; resume when it is fixed)` : `Failed: ${run.error || ''}`;
     const syn = run.synthesizer || {};
     const sSteps = syn.steps || [];
     const nDone = sSteps.filter((x) => x.status === 'done' || x.status === 'failed').length;
@@ -152,7 +178,7 @@ export async function render(root, ctx) {
   async function startRun(mode) {
     if (running) return;
     try {
-      const res = await api.post(`${W}/${mode === 'retry' ? 'retry' : 'run'}`, {});
+      const res = await api.post(`${W}/${mode === 'retry' || mode === 'resume' ? mode : 'run'}`, {});
       running = true;
       drawHead();
       drawProgress(res.run);
@@ -178,6 +204,8 @@ export async function render(root, ctx) {
     if (run && run.status === 'done') {
       ui.toast(`Step ${run.step} (${run.period}) saved${run.partial ? ' — partial: some synthesizer steps failed' : ''}`, run.partial ? 'bad' : 'ok');
       selected = latest;
+    } else if (run && run.status === 'paused') {
+      ui.toast('The iteration is paused: what finished is saved. Fix the cause, then resume.', 'bad');
     } else if (run) {
       ui.toast('The iteration failed: the state is unchanged.', 'bad');
     }
