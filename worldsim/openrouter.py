@@ -7,7 +7,8 @@ parsed JSON body or None). The default uses `requests`; tests pass a fake, so no
   ``X-Title: WorldSim``. The key is only ever put in that header: errors are redacted before they leave.
 - key_info(): GET {base}/key (the "Test key" button).
 - ModelCatalog: GET {base}/models (public, no key), cached in <data>/models_cache.json for a day; a built-in entry for
-  the default model when the list cannot be fetched (WORLDSIM_OFFLINE=1, no network).
+  the default model when the list cannot be fetched (WORLDSIM_OFFLINE=1, no network). Each entry says whether the
+  model takes the `reasoning` parameter (supported_parameters lists "reasoning" or "include_reasoning").
 """
 from __future__ import annotations
 
@@ -106,6 +107,10 @@ class OpenRouterClient:
                 "X-Title": config.APP_TITLE, "Content-Type": "application/json"}
 
     def _send(self, method: str, path: str, body: Any, timeout: float) -> Any:
+        return self._exchange(method, path, body, timeout)[1]
+
+    def _exchange(self, method: str, path: str, body: Any, timeout: float) -> tuple[int, Any]:
+        """(HTTP status, parsed body) of one request, or a readable, redacted OpenRouterError."""
         if not self._key:
             raise OpenRouterError("no OpenRouter key: add one in Settings (or switch to Mock)", retryable=False,
                                   kind="auth")
@@ -125,10 +130,14 @@ class OpenRouterClient:
                                   "auth" if status in (401, 402, 403) else "http")
         if data is None:
             raise OpenRouterError("OpenRouter returned a body that is not JSON", status, True, "parse")
-        return data
+        return status, data
 
     def chat(self, body: dict, timeout: float) -> dict:
         return self._send("POST", "/chat/completions", body, timeout)
+
+    def chat_exchange(self, body: dict, timeout: float) -> tuple[int, dict]:
+        """chat() with the HTTP status (kept in the audit of each call)."""
+        return self._exchange("POST", "/chat/completions", body, timeout)
 
     def key_info(self, timeout: float = 20) -> dict:
         data = self._send("GET", "/key", None, timeout)
@@ -168,7 +177,19 @@ def _compact(m: dict) -> dict | None:
             "reasoning": bool(efforts), "reasoning_efforts": efforts,
             "reasoning_mandatory": bool(reasoning and reasoning.get("mandatory")),
             "default_effort": (reasoning or {}).get("default_effort") if reasoning else None,
+            # the model takes the `reasoning` parameter, so its reasoning can be asked for (and returned)
+            "reasoning_param": "reasoning" in params or "include_reasoning" in params,
             "temperature": "temperature" in params}
+
+
+def accepts_reasoning(info: dict | None) -> bool | None:
+    """Whether a catalogue entry takes the `reasoning` parameter (None: the model is not in the list). An entry cached
+    before the flag existed falls back to its `reasoning` flag (read from the same supported_parameters)."""
+    if info is None:
+        return None
+    if "reasoning_param" in info:
+        return bool(info["reasoning_param"])
+    return bool(info.get("reasoning"))
 
 
 class ModelCatalog:

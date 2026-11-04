@@ -374,3 +374,35 @@ table.list tr.current td { background: var(--accent-soft); }
   .actor-out dt { margin-top: 4px; }
 }
 input[type=number].num-narrow { width: 96px; }
+
+/* ---------------------------------------------------------------- audit */
+.audit-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 12px; align-items: start; }
+.audit-list { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; padding: 10px; }
+.audit-who { list-style: none; margin: 0 0 8px; padding: 0; }
+.audit-who-btn { width: 100%; text-align: left; background: none; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px;
+  cursor: pointer; color: var(--ink); font: inherit; display: flex; flex-direction: column; gap: 3px; }
+.audit-who-btn:hover { background: var(--panel-2); }
+.audit-who-btn.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.audit-who-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.audit-who-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+.audit-detail { min-width: 0; }
+.audit-nav { flex-wrap: nowrap; }
+.audit-nav select { width: auto; max-width: 300px; min-width: 0; }
+.audit-detail > .card { margin-bottom: 12px; }
+.audit-final summary, .audit-sec > summary { cursor: pointer; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 4px 0; }
+.audit-sec { border-top: 1px solid var(--line-2); padding-top: 6px; margin-top: 8px; }
+.audit-msg { border: 1px solid var(--line); border-radius: 8px; margin: 6px 0; background: var(--panel-2); }
+.audit-msg > summary { cursor: pointer; padding: 6px 10px; font-size: 12.5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.audit-pre { margin: 0; padding: 8px 10px; max-height: 420px; overflow: auto; font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.audit-thinking { border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 8px; background: var(--panel-2); margin-top: 6px; }
+.audit-attempt .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 12px; font-size: 12.5px; margin: 4px 0 8px; }
+.audit-attempt .kv .k { color: var(--ink-3); margin-right: 6px; }
+.audit-attempt .kv .v { overflow-wrap: anywhere; }
+.audit-meta { margin-top: 8px; overflow-wrap: anywhere; }
+.flag.ok { color: var(--ok); } .flag.bad { color: var(--bad); }
+.audit-detail .flag { font-size: 12.5px; margin: 4px 0; }
+@media (max-width: 760px) {
+  .audit-layout { grid-template-columns: minmax(0, 1fr); }
+  .audit-list { position: static; max-height: 260px; }
+}

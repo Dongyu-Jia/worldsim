@@ -7,6 +7,7 @@ import * as ui from './ui.js';
 
 const PAGES = [
   { id: 'sim', name: 'Simulation', ico: '▶', needsWorld: true, load: () => import('./pages/sim.js') },
+  { id: 'audit', name: 'Audit', ico: '⌕', needsWorld: true, load: () => import('./pages/audit.js') },
   { id: 'actors', name: 'Actors', ico: '◎', needsWorld: true, load: () => import('./pages/actors.js') },
   { id: 'schema', name: 'Schema', ico: '▦', needsWorld: true, load: () => import('./pages/schema.js') },
   { id: 'synth', name: 'Synthesizer', ico: '◇', needsWorld: true, load: () => import('./pages/synth.js') },

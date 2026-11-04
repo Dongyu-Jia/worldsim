@@ -5,10 +5,19 @@ A backend answers ``complete(CallRequest) -> Completion`` or raises LLMError:
 - OpenRouterBackend: one chat completion; structured outputs (response_format json_schema, strict) when the model
   lists them, else json_object; a json_schema request the provider refuses (HTTP 400/404/422) is retried once as
   json_object. Usage accounting on; the cost comes from OpenRouter's usage.cost, else from the catalogue's prices.
-- MockBackend: deterministic, schema-valid answers built from the request's context (no key, no network). A script
-  ``{call key: [behaviour, ...]}`` (call keys "actor:<id>", "synth:<step key>", "synth:<step kind>", "synth";
-  behaviours ok | error | bad_json | timeout | invalid | long | extra) makes the next calls behave in a chosen way,
-  for tests and demos.
+  For a model that takes the `reasoning` parameter, the reasoning is asked for (``reasoning: {exclude: false}``,
+  plus the effort when one is set) unless "Record the model's thinking" is off; a model without it never gets the
+  parameter (with provider.require_parameters it would find no endpoint).
+- MockBackend: deterministic, schema-valid answers built from the request's context (no key, no network), with a
+  marked mock thinking text and a raw response in OpenRouter's shape. A script ``{call key: [behaviour, ...]}``
+  (call keys "actor:<id>", "synth:<step key>", "synth:<step kind>", "synth"; behaviours ok | error | bad_json |
+  timeout | invalid | long | extra) makes the next calls behave in a chosen way, for tests and demos.
+
+Every Completion (and every LLMError) carries what the audit view shows: ``thinking`` (parse_thinking: the reasoning
+as the provider returned it) and ``audit``: the request body as sent without its messages (the caller keeps those),
+the raw response JSON (each capped at AUDIT_CAP bytes, a truncated copy marked so), and the HTTP attempts (format,
+status, error), two when the json_schema request fell back to json_object. The key is only ever in the Authorization
+header, never in a body, and every recorded text is redacted.
 
 extract_json(text) -> (object | None, error | None): the JSON object in a model's text (code fences, prose around it,
 trailing commas, Python literals and smart quotes outside strings are tolerated).
@@ -25,8 +34,10 @@ from typing import Any
 
 from . import config
 from . import model as M
-from .openrouter import ModelCatalog, OpenRouterClient, OpenRouterError, Transport
+from .openrouter import ModelCatalog, OpenRouterClient, OpenRouterError, Transport, accepts_reasoning
 from .settings import redact
+
+AUDIT_CAP = 256 * 1024                 # bytes kept of a recorded request body, raw response or thinking text
 
 
 @dataclass
@@ -42,6 +53,7 @@ class CallRequest:
     timeout_s: float = 240
     context: dict = field(default_factory=dict)      # structured inputs (the mock answers from them)
     repair: bool = False
+    record_thinking: bool = True                      # ask a reasoning model to return its reasoning
 
 
 @dataclass
@@ -52,14 +64,111 @@ class Completion:
     model: str
     response_format: str
     meta: dict = field(default_factory=dict)
+    thinking: dict = field(default_factory=dict)     # parse_thinking()
+    audit: dict = field(default_factory=dict)        # audit_record(): request, raw response, HTTP attempts
 
 
 class LLMError(RuntimeError):
-    def __init__(self, message: str, kind: str = "error", retryable: bool = True, status: int | None = None):
+    def __init__(self, message: str, kind: str = "error", retryable: bool = True, status: int | None = None,
+                 audit: dict | None = None):
         super().__init__(message)
         self.kind = kind
         self.retryable = retryable
         self.status = status
+        self.audit = audit or {}                      # what was sent (and received) before the failure
+
+
+# ------------------------------------------------------------------------------------------------ the audit record
+
+def scrub(obj: Any, secrets: list[str] | tuple[str, ...] = ()) -> Any:
+    """obj with every string redacted (settings.redact): what is recorded never holds the key."""
+    if isinstance(obj, str):
+        return redact(obj, secrets)
+    if isinstance(obj, dict):
+        return {k: scrub(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [scrub(v, secrets) for v in obj]
+    return obj
+
+
+def capped(obj: Any, limit: int = AUDIT_CAP) -> tuple[Any, bool]:
+    """(obj, False) when its JSON fits in `limit` bytes, else ({truncated, bytes, text: the first bytes}, True)."""
+    if obj is None:
+        return None, False
+    text = json.dumps(obj, ensure_ascii=False)
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return obj, False
+    return {"truncated": True, "bytes": len(raw), "text": raw[:limit].decode("utf-8", "ignore")}, True
+
+
+def audit_record(body: dict | None, raw: Any, http_attempts: list[dict], secrets: list[str] | tuple[str, ...] = (),
+                 thinking: dict | None = None) -> dict:
+    """What one call sent and got back. The body is kept without "messages": the caller records those, and the exact
+    body is {"model", "messages", ...the rest} again (audit.exact_request)."""
+    params = {k: v for k, v in (body or {}).items() if k != "messages"} if body is not None else None
+    req, req_cut = capped(scrub(params, secrets))
+    resp, resp_cut = capped(scrub(raw, secrets))
+    out = {"request": req, "request_truncated": req_cut, "raw_response": resp, "raw_response_truncated": resp_cut,
+           "http_attempts": scrub(http_attempts, secrets)}
+    if thinking is not None:
+        out["thinking"] = thinking
+    return out
+
+
+def parse_thinking(msg: dict | None, capture: str = "on", reasoning_tokens: Any = None) -> dict:
+    """The model's reasoning as OpenRouter returned it in choices[0].message: `reasoning` (a plain string) and
+    `reasoning_details` (blocks reasoning.text {text, signature}, reasoning.summary {summary}, reasoning.encrypted
+    {data}; each with format, index, id). -> {text, blocks [{type text|summary, text, format, index, id, signed}],
+    encrypted_blocks, source reasoning|reasoning_details|none, capture, reasoning_tokens}. `capture`: on (asked
+    for), off (the setting is off), unsupported (the model does not take the parameter), unknown (not in the model
+    list, nothing asked). Encrypted blocks cannot be read: only their number is kept."""
+    msg = msg if isinstance(msg, dict) else {}
+    plain = msg.get("reasoning") if isinstance(msg.get("reasoning"), str) else ""
+    details = msg.get("reasoning_details") if isinstance(msg.get("reasoning_details"), list) else []
+    blocks: list[dict] = []
+    encrypted = 0
+    for i, d in enumerate(details):
+        if not isinstance(d, dict):
+            continue
+        kind = str(d.get("type") or "")
+        if kind == "reasoning.encrypted":
+            encrypted += 1
+            continue
+        first = "summary" if kind == "reasoning.summary" else "text"
+        body = next((d[k] for k in (first, "text", "summary") if isinstance(d.get(k), str) and d[k].strip()), "")
+        if not body:
+            continue
+        blocks.append({"type": kind.rsplit(".", 1)[-1] or "text", "text": body, "format": d.get("format"),
+                       "index": d.get("index", i), "id": d.get("id"), "signed": bool(d.get("signature"))})
+    if plain.strip():
+        text, source = plain, "reasoning"
+    elif blocks:
+        text, source = "\n\n".join(b["text"] for b in blocks), "reasoning_details"
+    else:
+        text, source = "", "none"
+    cut, truncated = capped(text)
+    return {"text": cut["text"] if truncated else text, "text_truncated": truncated, "blocks": blocks,
+            "encrypted_blocks": encrypted, "source": source, "capture": capture,
+            "reasoning_tokens": reasoning_tokens if isinstance(reasoning_tokens, (int, float)) else None}
+
+
+def request_body(req: CallRequest, fmt: str, reasoning: dict | None) -> dict:
+    """The chat-completions body for this request (the key goes in the Authorization header, never here)."""
+    body: dict[str, Any] = {"model": req.model, "messages": req.messages, "usage": {"include": True}}
+    if req.temperature is not None:
+        body["temperature"] = req.temperature
+    if req.max_tokens:
+        body["max_tokens"] = req.max_tokens
+    if reasoning:
+        body["reasoning"] = reasoning
+    if fmt == "json_schema":
+        body["response_format"] = {"type": "json_schema",
+                                   "json_schema": {"name": req.schema_name, "strict": True, "schema": req.json_schema}}
+        body["provider"] = {"require_parameters": True}
+    elif fmt == "json_object":
+        body["response_format"] = {"type": "json_object"}
+    return body
 
 
 # ------------------------------------------------------------------------------------------------ JSON extraction
@@ -175,65 +284,98 @@ class OpenRouterBackend:
             return "json_schema"
         return "json_object" if info.get("response_format") else "none"
 
+    def _reasoning(self, req: CallRequest) -> tuple[dict | None, str]:
+        """(the `reasoning` parameter or None, the thinking capture: on | off | unsupported | unknown)."""
+        ok = accepts_reasoning(self.catalog.lookup(req.model))
+        effort = req.reasoning_effort
+        if ok is False:
+            return None, "unsupported"                 # never sent: require_parameters would find no endpoint
+        if not req.record_thinking:
+            # as before the audit view: the reasoning text is not returned (exclude); its tokens are still billed
+            return ({"effort": effort, "exclude": True} if effort else None), "off"
+        if ok:
+            return ({"effort": effort, "exclude": False} if effort else {"exclude": False}), "on"
+        return ({"effort": effort, "exclude": False} if effort else None), ("on" if effort else "unknown")
+
     def _body(self, req: CallRequest, fmt: str) -> dict:
-        body: dict[str, Any] = {"model": req.model, "messages": req.messages, "usage": {"include": True}}
-        if req.temperature is not None:
-            body["temperature"] = req.temperature
-        if req.max_tokens:
-            body["max_tokens"] = req.max_tokens
-        if req.reasoning_effort:
-            # the reasoning text is not needed (exclude); its tokens are still billed and reported in usage
-            body["reasoning"] = {"effort": req.reasoning_effort, "exclude": True}
-        if fmt == "json_schema":
-            body["response_format"] = {"type": "json_schema",
-                                       "json_schema": {"name": req.schema_name, "strict": True,
-                                                       "schema": req.json_schema}}
-            body["provider"] = {"require_parameters": True}
-        elif fmt == "json_object":
-            body["response_format"] = {"type": "json_object"}
-        return body
+        return request_body(req, fmt, self._reasoning(req)[0])
 
     def complete(self, req: CallRequest) -> Completion:
         fmt = self._format_for(req.model)
+        reasoning, capture = self._reasoning(req)
+        attempts: list[dict] = []
+        sent: dict = {}
+
+        def send(fmt: str) -> dict:
+            body = request_body(req, fmt, reasoning)
+            if sent:                                    # the refused body, kept with its attempt (the schema)
+                attempts[-1]["request"] = {k: v for k, v in sent["body"].items() if k != "messages"}
+            sent["body"] = body
+            t0 = time.monotonic()
+            try:
+                status, data = self._client.chat_exchange(body, req.timeout_s)
+            except OpenRouterError as err:
+                attempts.append({"format": fmt, "status": err.status, "ok": False, "error": redact(str(err), [self._key]),
+                                 "duration_s": round(time.monotonic() - t0, 3)})
+                raise
+            attempts.append({"format": fmt, "status": status, "ok": True, "error": None,
+                             "duration_s": round(time.monotonic() - t0, 3)})
+            return data
+
+        def failed(err: OpenRouterError) -> LLMError:
+            return LLMError(redact(str(err), [self._key]), err.kind, err.retryable, err.status,
+                            audit_record(sent.get("body"), None, attempts, [self._key], parse_thinking(None, capture)))
         try:
-            data = self._client.chat(self._body(req, fmt), req.timeout_s)
+            data = send(fmt)
         except OpenRouterError as err:
             if fmt == "json_schema" and err.status in (400, 404, 422):
                 fmt = "json_object"
                 try:
-                    data = self._client.chat(self._body(req, fmt), req.timeout_s)
+                    data = send(fmt)
                 except OpenRouterError as err2:
-                    raise LLMError(redact(str(err2), [self._key]), err2.kind, err2.retryable, err2.status) from None
+                    raise failed(err2) from None
             else:
-                raise LLMError(redact(str(err), [self._key]), err.kind, err.retryable, err.status) from None
-        return self._parse(req, data, fmt)
+                raise failed(err) from None
+        return self._parse(req, data, fmt, sent["body"], attempts, capture)
 
-    def _parse(self, req: CallRequest, data: dict, fmt: str) -> Completion:
+    def _parse(self, req: CallRequest, data: dict, fmt: str, body: dict | None = None,
+               attempts: list[dict] | None = None, capture: str = "on") -> Completion:
+        secrets = [self._key]
+        usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else {}
+        details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+        pdetails = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+        u = {"prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+             "reasoning_tokens": details.get("reasoning_tokens"), "cached_tokens": pdetails.get("cached_tokens"),
+             "total_tokens": usage.get("total_tokens")}
         choices = data.get("choices") if isinstance(data, dict) else None
-        if not isinstance(choices, list) or not choices:
-            raise LLMError("OpenRouter returned no choices", "empty")
-        choice = choices[0] if isinstance(choices[0], dict) else {}
-        if isinstance(choice.get("error"), dict):
-            raise LLMError(redact(f"provider error: {choice['error'].get('message', '')}"[:400], [self._key]), "http")
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
         msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        thinking = scrub(parse_thinking(msg, capture, u["reasoning_tokens"]), secrets)
+        audit = audit_record(body, data, attempts or [], secrets, thinking)
+
+        def fail(message: str, kind: str) -> LLMError:
+            return LLMError(redact(message, secrets), kind, audit=audit)
+        if not isinstance(choices, list) or not choices:
+            raise fail("OpenRouter returned no choices", "empty")
+        if isinstance(choice.get("error"), dict):
+            raise fail(f"provider error: {choice['error'].get('message', '')}"[:400], "http")
         content = msg.get("content")
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
         if not isinstance(content, str) or not content.strip():
             fin = choice.get("finish_reason") or choice.get("native_finish_reason") or "unknown"
-            raise LLMError(f"empty answer (finish reason: {fin})", "empty")
-        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
-        u = {"prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
-             "reasoning_tokens": details.get("reasoning_tokens"), "total_tokens": usage.get("total_tokens")}
+            raise fail(f"empty answer (finish reason: {fin})", "empty")
         cost = usage.get("cost")
         cost_source = "openrouter"
         if not isinstance(cost, (int, float)):
             cost, cost_source = price(self.catalog.lookup(req.model), u), "computed"
+        audit.pop("thinking", None)
         return Completion(text=content, usage=u, cost=float(cost) if cost is not None else None,
                           model=str(data.get("model") or req.model), response_format=fmt,
                           meta={"id": data.get("id"), "provider": data.get("provider"),
-                                "finish_reason": choice.get("finish_reason"), "cost_source": cost_source})
+                                "finish_reason": choice.get("finish_reason"),
+                                "native_finish_reason": choice.get("native_finish_reason"), "cost_source": cost_source},
+                          thinking=thinking, audit=audit)
 
 
 def price(info: dict | None, usage: dict) -> float | None:
@@ -281,7 +423,10 @@ class MockBackend:
     decision question with a short text picked by hash of (world, step, actor, question) and add 0-2 autonomous
     actions; the synthesizer's digest lists the decisions, each indicator chunk moves about a third of its numeric
     fields a little (inside their plausible range), each question chunk updates about a third of its statuses, and
-    the narrative counts what moved.
+    the narrative counts what moved. Every answer comes with a mock thinking text (marked 「（模拟思考）」 /
+    "(mock thinking)") that walks through the actor's questions or the step's items, counted as reasoning tokens and
+    returned as OpenRouter would (message.reasoning and a reasoning.summary block) unless the thinking capture is off;
+    the recorded request is the body OpenRouter would get, and the raw response has OpenRouter's shape.
 
     A script {call key: [behaviour, ...]} makes the next calls of that key behave in a chosen way: behaviours ok |
     error | timeout | bad_json | invalid (an actor leaves its required questions unanswered; a synthesizer step
@@ -317,25 +462,105 @@ class MockBackend:
             step = ctx.get("step") or {}
             keys = [f"synth:{step.get('key')}{sfx}", f"synth:{step.get('kind')}{sfx}", f"synth{sfx}"]
         behaviour = self._next(keys)
-        if behaviour == "error":
-            raise LLMError("mock: injected failure", "http")
-        if behaviour == "timeout":
-            raise LLMError("mock: injected timeout", "timeout")
-        if behaviour == "bad_json":
-            text = "Sure! Here is my answer: {\"answers\": oops, not json"
-        elif req.purpose == "actor":
+        effort = req.reasoning_effort
+        capture = "on" if req.record_thinking else "off"
+        body = request_body(req, "json_schema", {"effort": effort, "exclude": not req.record_thinking} if effort
+                            else {"exclude": not req.record_thinking})
+        if behaviour in ("error", "timeout"):
+            raise LLMError(f"mock: injected {'failure' if behaviour == 'error' else 'timeout'}",
+                           "http" if behaviour == "error" else "timeout",
+                           audit=audit_record(body, None, [], thinking=parse_thinking(None, capture)))
+        if req.purpose == "actor":
             obj = self._actor(ctx)
             if behaviour == "invalid":
                 obj["answers"] = {}
-            text = json.dumps(obj, ensure_ascii=False)
         else:
             obj = {} if behaviour == "invalid" else self._synth(ctx, behaviour)
-            text = json.dumps(obj, ensure_ascii=False)
+        text = json.dumps(obj, ensure_ascii=False)
+        thought = self._thinking(req, ctx, obj, behaviour)
+        if behaviour == "bad_json":
+            text = "Sure! Here is my answer: {\"answers\": oops, not json"
         prompt = "".join(m.get("content", "") for m in req.messages)
-        usage = {"prompt_tokens": est_tokens(prompt), "completion_tokens": est_tokens(text), "reasoning_tokens": 0}
+        rt = est_tokens(thought)
+        usage = {"prompt_tokens": est_tokens(prompt), "completion_tokens": est_tokens(text) + rt, "reasoning_tokens": rt,
+                 "cached_tokens": 0}
         usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        msg: dict[str, Any] = {"role": "assistant", "content": text}
+        if req.record_thinking:
+            msg["reasoning"] = thought
+            msg["reasoning_details"] = [{"type": "reasoning.summary", "summary": thought, "format": "mock", "index": 0,
+                                         "id": None}]
+        gen = f"gen-mock-{_h(req.model, text, thought) % 10**12:012d}"
+        raw = {"id": gen, "provider": "Mock", "model": f"mock/{req.model}", "object": "chat.completion",
+               "created": int(time.time()),
+               "choices": [{"index": 0, "finish_reason": "stop", "native_finish_reason": "stop", "message": msg}],
+               "usage": {"prompt_tokens": usage["prompt_tokens"], "completion_tokens": usage["completion_tokens"],
+                         "total_tokens": usage["total_tokens"], "cost": 0,
+                         "completion_tokens_details": {"reasoning_tokens": rt},
+                         "prompt_tokens_details": {"cached_tokens": 0}}}
+        thinking = {**parse_thinking(msg, capture, rt), "mock": True}
         return Completion(text=text, usage=usage, cost=0.0, model=f"mock/{req.model}", response_format="mock",
-                          meta={"cost_source": "mock"})
+                          meta={"cost_source": "mock", "id": gen, "provider": "Mock", "finish_reason": "stop",
+                                "native_finish_reason": "stop"},
+                          thinking=thinking, audit=audit_record(body, raw, []))
+
+    # ------------------------------------------------------------------ mock thinking
+    @staticmethod
+    def _thinking(req: CallRequest, ctx: dict, obj: dict, behaviour: str) -> str:
+        """A short, marked walk through what the call answers: the actor's questions (and the variant it picks), or
+        the step's items (and what it writes for them)."""
+        world = ctx.get("world") or {}
+        zh = _zh(world.get("language", ""))
+        head = "（模拟思考）" if zh else "(mock thinking) "
+        lines: list[str] = []
+        if req.repair:
+            lines.append(head + ("上一次的回答无法使用：这次只给出更正后的 JSON 对象。" if zh
+                                 else "The previous answer could not be used: this time only the corrected JSON object."))
+        if req.purpose == "actor":
+            actor = ctx.get("actor") or {}
+            state = ctx.get("state") or {}
+            qs = actor.get("decision_questions") or []
+            given = obj.get("answers") or {}
+            lines.append(head + (f"我是{actor.get('name')}，{state.get('period', '')} 之后的这一期要回答 {len(qs)} 个决策问题。"
+                                 if zh else f"I am {actor.get('name')}; after {state.get('period', '')} I answer "
+                                            f"{len(qs)} decision question(s)."))
+            for i, q in enumerate(qs, 1):
+                a = given.get(q["id"]) or {}
+                pick = a.get("value") or ("（先不回答）" if zh else "(no answer this time)")
+                lines.append(f"{i}. {_short(q['text'], 60)} → {_short(pick, 80)}")
+            acts = obj.get("actions") or []
+            if (actor.get("autonomy") or {}).get("enabled"):
+                lines.append((f"自主行动：本期采取 {len(acts)} 项。" if zh else f"Autonomous actions: {len(acts)} this time.")
+                             + "".join(f" {a.get('title')}" for a in acts))
+            lines.append("最后写公开表态和总体理由。" if zh else "Then a public statement and the overall rationale.")
+        else:
+            step = ctx.get("step") or {}
+            kind = step.get("kind")
+            label = step.get("label") or kind
+            results = ctx.get("actor_results") or []
+            if kind == "digest":
+                ok = [r.get("name") for r in results if r.get("status") == "ok" and r.get("output")]
+                lines.append(head + (f"{label}：读 {len(results)} 方的决策，其中 {len(ok)} 方作出了决定："
+                                     if zh else f"{label}: reading {len(results)} actors' decisions, {len(ok)} decided: ")
+                             + ("、" if zh else ", ").join(map(str, ok)))
+                lines.append("找出相互作用与主导力量，写成本季要事。" if zh else "Find how they interact and what dominates.")
+            elif kind == "values":
+                lines.append(head + (f"{label}：逐项判断这些指标的新值。" if zh else f"{label}: the new value of each indicator."))
+                prev = (ctx.get("state") or {}).get("values") or {}
+                for fid, e in ((obj.get("values") or {}).items()):
+                    v = e.get("value") if isinstance(e, dict) else e
+                    lines.append(f"- {fid}: {prev.get(fid)} → {v}")
+            elif kind == "statuses":
+                lines.append(head + (f"{label}：逐个问题判断现状是否变化。" if zh else f"{label}: does each status change?"))
+                for qid, e in ((obj.get("statuses") or {}).items()):
+                    changed = bool(e.get("changed")) if isinstance(e, dict) else False
+                    lines.append(f"- {qid}: " + (("有变化" if changed else "不变") if zh else ("changed" if changed else "unchanged")))
+            else:
+                lines.append(head + ("把新的指标和现状浓缩成一段叙述，控制字数。" if zh
+                                     else "Condense the new values and statuses into the narrative, within the limit."))
+        if behaviour == "bad_json":
+            lines.append("（这次故意写出无法解析的回答。）" if zh else "(this time the answer is deliberately unreadable.)")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ actors
     @staticmethod

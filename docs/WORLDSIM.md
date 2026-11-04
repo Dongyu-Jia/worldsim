@@ -74,7 +74,10 @@ Open **Settings → OpenRouter API key**, paste the key (`sk-or-v1-…`, from ht
   `models_cache.json` in the data folder) with search; any model id can also be typed. Overrides: per world (Worlds page),
   per actor (Actors page) and for the synthesizer (Synthesizer page).
 - **Settings**: temperature, reasoning effort (blank = the model's default), max parallel calls (default 6), timeout
-  per call (default 240 s), max tokens (blank = provider default).
+  per call (default 240 s), max tokens (blank = provider default), and *Record the model's thinking* (default on):
+  for a model whose `supported_parameters` include `reasoning`, every request carries `reasoning: {exclude: false}`
+  (plus the effort when one is set), so the reasoning comes back and is saved with the call. It costs nothing extra:
+  reasoning tokens are billed whether or not they are returned. A model without the parameter never gets it.
 - **Requests**: `POST /api/v1/chat/completions` with `HTTP-Referer: http://localhost`, `X-Title: WorldSim`,
   `usage: {include: true}`, and `response_format: {type: "json_schema", strict: true}` when the model lists structured
   outputs (with `provider.require_parameters`), else `{type: "json_object"}`; if a provider refuses the JSON schema
@@ -143,7 +146,20 @@ outputs are kept, so only the synthesizer runs again) or **Discard**.
   the narrative, the indicator table (value, change, reason, flags), the state questions with their statuses (changed
   ones marked, with the reason and the previous status), and the iteration: each actor's answers (question → answer
   → rationale; unanswered ones marked) and autonomous actions as cards, every synthesizer step with its output and
-  its input and raw output on demand, and the lists of value and status changes. Rewind and fork.
+  its input and raw output on demand, and the lists of value and status changes. Rewind and fork. Every actor card
+  and synthesizer step links to its audit.
+- **Audit**: one step (or the failed attempt awaiting retry) at a time; the participants (the actors, then the
+  synthesizer steps) with status, number of calls and whether thinking was recorded; for the chosen one, its final
+  accepted output and then every call in order (first call, repair, retry round), each in three parts: **Input**
+  (the messages exactly as sent with their roles, the request settings, the answer's JSON schema and the exact request
+  body; the key is only in a header and never recorded), **Thinking** (the reasoning exactly as the provider returned
+  it in `message.reasoning` or `reasoning_details`, with the reasoning tokens; otherwise a note says why there is none:
+  the model returned no readable thinking, only encrypted blocks, capture is off, the model takes no reasoning
+  parameter, or the call was saved before thinking capture existed; the mock's text is marked as mock) and
+  **Output** (the raw response text, the JSON parsed from it, accepted or why not, notes, the finish reason, the raw
+  response JSON and, after a refused schema, both HTTP requests). *Older* / *Newer* keep the participant, to follow
+  one actor across steps. Links: `#audit?step=3&who=fed`, `#audit?step=pending`. What "thinking" is depends on the
+  provider: Gemini returns thought summaries, not its raw chain of thought.
 - **Actors**: list and editor (name, id, enabled, role, cares, **decision questions** with add / edit / delete /
   reorder, question text, guidance and required, **autonomous actions** on / off with the maximum and guidance,
   private info, visible fields, model override).
@@ -174,7 +190,9 @@ All server and model text is inserted as text, never as HTML, under a strict Con
                                              synthesizer, initial state
 <data>/worlds/<id>/steps/000000.json         the state at each step (step 0 = the initial state)
 <data>/worlds/<id>/iterations/000001.json     how step n was produced (outputs, digest, synthesizer steps,
-                                             flags, prompts, usage, cost)
+                                             flags, usage, cost) and every call: messages, request body (without
+                                             its messages), thinking, raw response, parsed JSON, verdict, HTTP
+                                             attempts (each text capped at 256 KB, a cut copy marked so)
 <data>/worlds/<id>/pending.json              a failed synthesizer attempt awaiting retry
 <data>/worlds/<id>/pre_v2/                   world.json and steps/ as they were before a migration (below)
 ```
@@ -363,7 +381,7 @@ that data. The `data/…` paths below are in Causeway's repository; refresh the 
 
 | Method and path | What it does |
 |---|---|
-| `GET /health`, `GET /settings`, `PUT /settings`, `POST /settings/test_key` | status; settings (key masked); update (`api_key`, `clear_key`, `backend`, `default_model`, `temperature`, `reasoning_effort`, `max_parallel`, `timeout_s`, `max_tokens`); check the key |
+| `GET /health`, `GET /settings`, `PUT /settings`, `POST /settings/test_key` | status; settings (key masked); update (`api_key`, `clear_key`, `backend`, `default_model`, `temperature`, `reasoning_effort`, `max_parallel`, `timeout_s`, `max_tokens`, `record_thinking`); check the key |
 | `GET /models?refresh=1` | the model list |
 | `GET /worlds`, `POST /worlds` (`{mode: blank\|template, name}`), `POST /worlds/import` | list, create, import (a first-format file is migrated) |
 | `GET\|PUT\|DELETE /worlds/{id}` | read (with steps, a pending failure and `calls_per_iteration`), update settings and the `description`, delete (`{confirm: true}`) |
@@ -371,7 +389,8 @@ that data. The `data/…` paths below are in Causeway's repository; refresh the 
 | `PUT /worlds/{id}/initial` (`{period?, values?, statuses?, narrative?}`), `/actors` (`{actors}`), `/synthesizer` (`{instructions, model, max_items_per_call}`) | edit (validated; 400 with `problems`) |
 | `POST /worlds/{id}/duplicate`, `GET /worlds/{id}/export` | copy without history; download with history |
 | `POST /worlds/{id}/run`, `GET /worlds/{id}/run`, `POST /worlds/{id}/retry`, `POST /worlds/{id}/discard` | start an iteration (background), live progress (actors and synthesizer steps), retry or drop a failed synthesizer attempt |
-| `GET /worlds/{id}/steps`, `/steps/{n}`, `/iterations/{n}/calls`, `/pending/calls` | history (with `partial` and change counts), one step with its iteration, the prompts and raw responses |
+| `GET /worlds/{id}/steps`, `/steps/{n}`, `/iterations/{n}/calls`, `/pending/calls` | history (with `partial` and change counts), one step with its iteration (calls without their texts), every call in full |
+| `GET /worlds/{id}/iterations/{n}/audit[?who=…]`, `/pending/audit[?who=…]` | the audit view: the participants, or one participant's final output and every call (input, thinking, output, meta); `who` is an actor id or `synthesizer:<step key>` |
 | `POST /worlds/{id}/rewind` (`{step, confirm: true}`), `POST /worlds/{id}/fork` (`{step, name}`) | rewind, fork |
 | `GET /worlds/{id}/estimate` | the cost estimate of the next iteration (one row per call; `counts` of actor and synthesizer calls) |
 
